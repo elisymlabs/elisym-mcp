@@ -1,3 +1,4 @@
+mod crypto;
 mod install;
 mod server;
 mod tools;
@@ -31,6 +32,11 @@ struct Cli {
     /// Port for HTTP server (default: 8080).
     #[arg(long, default_value = "8080")]
     port: u16,
+
+    /// Bearer token for HTTP transport authentication.
+    /// Can also be set via ELISYM_HTTP_TOKEN env var.
+    #[arg(long)]
+    http_token: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -44,6 +50,18 @@ enum Commands {
         /// Bind to an existing elisym agent (reads ~/.elisym/agents/<name>/config.toml).
         #[arg(long)]
         agent: Option<String>,
+
+        /// Password to decrypt encrypted agent configs.
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Bearer token for HTTP transport authentication.
+        #[arg(long)]
+        http_token: Option<String>,
+
+        /// Set additional env vars (KEY=VALUE, can be repeated).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        extra_env: Vec<String>,
 
         /// List detected MCP clients and their status.
         #[arg(long)]
@@ -67,9 +85,12 @@ struct AgentConfig {
     capabilities: Vec<String>,
     #[serde(default)]
     relays: Vec<String>,
+    #[serde(default)]
     secret_key: String,
     #[serde(default)]
     payment: Option<PaymentSection>,
+    #[serde(default)]
+    encryption: Option<crypto::EncryptionSection>,
 }
 
 #[derive(Deserialize)]
@@ -80,9 +101,6 @@ struct PaymentSection {
     network: String,
     #[serde(default)]
     rpc_url: Option<String>,
-    #[serde(default = "default_token")]
-    #[allow(dead_code)]
-    token: String,
     #[serde(default)]
     solana_secret_key: String,
 }
@@ -92,9 +110,6 @@ fn default_chain() -> String {
 }
 fn default_network() -> String {
     "devnet".into()
-}
-fn default_token() -> String {
-    "sol".into()
 }
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
@@ -113,10 +128,47 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
         .join("agents")
         .join(name)
         .join("config.toml");
+
+    // Warn if config file is readable by others (contains secret keys)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mode = meta.mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{mode:04o}"),
+                    "Agent config file has insecure permissions (contains secret keys). \
+                     Consider: chmod 600 {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Agent '{}' not found at {}", name, path.display()))?;
-    let config: AgentConfig =
+    let mut config: AgentConfig =
         toml::from_str(&contents).with_context(|| format!("Invalid config for agent '{}'", name))?;
+
+    // Decrypt secrets if the config is encrypted
+    if let Some(ref enc) = config.encryption {
+        let password = std::env::var("ELISYM_AGENT_PASSWORD").with_context(|| {
+            format!(
+                "Agent '{}' has encrypted secrets. Set ELISYM_AGENT_PASSWORD env var to decrypt.",
+                name
+            )
+        })?;
+        let bundle = crypto::decrypt_secrets(enc, &password)
+            .with_context(|| format!("Failed to decrypt secrets for agent '{}'", name))?;
+        config.secret_key = bundle.nostr_secret_key;
+        if let Some(ref mut payment) = config.payment {
+            payment.solana_secret_key = bundle.solana_secret_key;
+        }
+        tracing::info!("Decrypted agent secrets");
+    }
+
     Ok(config)
 }
 
@@ -174,6 +226,7 @@ async fn start_http_server(
     agent: elisym_core::AgentNode,
     host: &str,
     port: u16,
+    http_token: Option<String>,
 ) -> Result<()> {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -206,7 +259,38 @@ async fn start_http_server(
             config,
         );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+
+    // Add bearer token auth middleware if configured
+    if let Some(token) = http_token {
+        use axum::http::StatusCode;
+
+        let expected = format!("Bearer {token}");
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let expected = expected.clone();
+                async move {
+                    let auth = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+                    // Note: not constant-time, but network jitter makes timing
+                    // attacks impractical for a local/internal HTTP transport token.
+                    if auth != expected {
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                    Ok(next.run(req).await)
+                }
+            },
+        ));
+        tracing::info!("HTTP bearer token authentication enabled");
+    } else if host != "127.0.0.1" && host != "localhost" {
+        tracing::warn!(
+            "HTTP transport exposed on {host} without authentication. \
+             Consider using --http-token for security."
+        );
+    }
 
     let bind_addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -234,12 +318,29 @@ async fn main() -> Result<()> {
         Some(Commands::Install {
             client,
             agent,
+            password,
+            http_token: install_http_token,
+            extra_env,
             list,
         }) => {
             if list {
                 install::run_list();
             } else {
-                install::run_install(client.as_deref(), agent.as_deref())?;
+                let mut env = Vec::new();
+                if let Some(ref pw) = password {
+                    env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.clone()));
+                }
+                if let Some(ref tok) = install_http_token {
+                    env.push(("ELISYM_HTTP_TOKEN".to_string(), tok.clone()));
+                }
+                for kv in &extra_env {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        env.push((k.to_string(), v.to_string()));
+                    } else {
+                        anyhow::bail!("Invalid --env format: '{kv}'. Expected KEY=VALUE.");
+                    }
+                }
+                install::run_install(client.as_deref(), agent.as_deref(), &env)?;
             }
             return Ok(());
         }
@@ -320,7 +421,10 @@ async fn main() -> Result<()> {
     if cli.http {
         #[cfg(feature = "transport-http")]
         {
-            start_http_server(agent, &cli.host, cli.port).await?;
+            let http_token = cli
+                .http_token
+                .or_else(|| std::env::var("ELISYM_HTTP_TOKEN").ok());
+            start_http_server(agent, &cli.host, cli.port, http_token).await?;
         }
         #[cfg(not(feature = "transport-http"))]
         {

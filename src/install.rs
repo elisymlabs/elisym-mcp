@@ -84,7 +84,7 @@ fn resolve_command() -> (String, Vec<String>) {
     ("npx".to_string(), vec!["-y".to_string(), "elisym-mcp".to_string()])
 }
 
-fn build_server_entry(agent: Option<&str>) -> Value {
+fn build_server_entry(agent: Option<&str>, env: &[(String, String)]) -> Value {
     let (command, args) = resolve_command();
 
     let mut entry = serde_json::json!({
@@ -92,16 +92,46 @@ fn build_server_entry(agent: Option<&str>) -> Value {
         "args": args,
     });
 
+    // Build env object from agent name + extra env vars
+    let mut env_map = serde_json::Map::new();
     if let Some(agent_name) = agent {
-        entry["env"] = serde_json::json!({
-            "ELISYM_AGENT": agent_name,
-        });
+        env_map.insert("ELISYM_AGENT".to_string(), Value::String(agent_name.to_string()));
+    }
+    for (k, v) in env {
+        env_map.insert(k.clone(), Value::String(v.clone()));
+    }
+    if !env_map.is_empty() {
+        entry["env"] = Value::Object(env_map);
     }
 
     entry
 }
 
-fn install_to_config(path: &PathBuf, agent: Option<&str>) -> Result<bool> {
+/// Validate install flags for conflicts and security concerns.
+fn validate_install_flags(
+    agent: Option<&str>,
+    env: &[(String, String)],
+) -> Result<()> {
+    // Reject conflicting --agent and --env ELISYM_AGENT
+    if agent.is_some() && env.iter().any(|(k, _)| k == "ELISYM_AGENT") {
+        anyhow::bail!(
+            "Cannot use both --agent and --env ELISYM_AGENT=... (they conflict)"
+        );
+    }
+
+    // Warn if password will be written to config file
+    let has_password = env.iter().any(|(k, _)| k == "ELISYM_AGENT_PASSWORD");
+    if has_password {
+        eprintln!(
+            "Warning: ELISYM_AGENT_PASSWORD will be stored in plaintext in the MCP client \
+             config file. For better security, set it as a system environment variable instead."
+        );
+    }
+
+    Ok(())
+}
+
+fn install_to_config(path: &PathBuf, agent: Option<&str>, env: &[(String, String)]) -> Result<bool> {
     // Read existing config or start fresh
     let mut config: Value = if path.exists() {
         let contents = std::fs::read_to_string(path)
@@ -112,19 +142,21 @@ fn install_to_config(path: &PathBuf, agent: Option<&str>) -> Result<bool> {
         serde_json::json!({})
     };
 
-    // Ensure mcpServers object exists
-    if config.get("mcpServers").is_none() {
+    // Ensure mcpServers is a JSON object
+    if !config.get("mcpServers").is_some_and(|v| v.is_object()) {
         config["mcpServers"] = serde_json::json!({});
     }
 
-    let servers = config["mcpServers"].as_object_mut().unwrap();
+    let servers = config["mcpServers"]
+        .as_object_mut()
+        .context("mcpServers is not an object")?;
 
     // Check if already installed
     if servers.contains_key("elisym") {
         return Ok(false);
     }
 
-    servers.insert("elisym".to_string(), build_server_entry(agent));
+    servers.insert("elisym".to_string(), build_server_entry(agent, env));
 
     // Write back
     if let Some(parent) = path.parent() {
@@ -203,7 +235,9 @@ pub fn run_list() {
     println!("  codex               codex mcp add elisym -- npx -y elisym-mcp");
 }
 
-pub fn run_install(client_filter: Option<&str>, agent: Option<&str>) -> Result<()> {
+pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(String, String)]) -> Result<()> {
+    validate_install_flags(agent, env)?;
+
     let mut installed = 0;
     let mut skipped = 0;
 
@@ -240,7 +274,7 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>) -> Result<(
             }
         }
 
-        match install_to_config(&path, agent) {
+        match install_to_config(&path, agent, env) {
             Ok(true) => {
                 println!("  Installed to {} ({})", client.name, path.display());
                 installed += 1;

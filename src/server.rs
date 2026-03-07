@@ -87,9 +87,8 @@ fn validate_payment_fee(request: &str) -> Option<String> {
 
 /// Truncate a string to `max` chars, appending "…" if truncated. UTF-8 safe.
 fn truncate_str(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() > max {
-        let truncated: String = chars[..max.saturating_sub(1)].iter().collect();
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{truncated}…")
     } else {
         s.to_string()
@@ -185,7 +184,7 @@ impl ElisymServer {
             name: self.agent.capability_card.name.clone(),
             description: self.agent.capability_card.description.clone(),
             capabilities: self.agent.capability_card.capabilities.clone(),
-            supported_kinds: vec![],
+            supported_kinds: vec![DEFAULT_KIND_OFFSET],
         };
         serde_json::to_string_pretty(&info)
             .unwrap_or_else(|e| format!("Error serializing identity: {e}"))
@@ -200,6 +199,7 @@ impl ElisymServer {
         let timeout_secs = input.timeout_secs.unwrap_or(15);
         let filter_chain = input.chain.unwrap_or_else(|| "solana".into());
         let filter_network = input.network.unwrap_or_else(|| "devnet".into());
+        let fetch_timeout = Some(std::time::Duration::from_secs(timeout_secs));
 
         // 1. Discover all agents and filter by chain + network
         let filter = elisym_core::AgentFilter::default();
@@ -225,42 +225,45 @@ impl ElisymServer {
             })
             .collect();
 
-        // Collect npubs of agents matching the network filter
-        let agent_npubs: std::collections::HashSet<String> = agents
+        // Build a pubkey → npub cache (bech32 encoding is not free)
+        let pk_to_npub: HashMap<PublicKey, String> = agents
             .iter()
-            .filter_map(|a| a.pubkey.to_bech32().ok())
+            .filter_map(|a| Some((a.pubkey, a.pubkey.to_bech32().ok()?)))
             .collect();
 
-        // 2. Fetch job result events (kind 6100) to calculate earnings
-        //    Filter by author pubkeys to only get results from agents in this network.
+        // 2. Fetch job result events (kind 6100) to calculate earnings.
+        //    Filter by author pubkeys and last 30 days to bound the query.
         let result_kind = kind(KIND_JOB_RESULT_BASE + DEFAULT_KIND_OFFSET);
         let author_pks: Vec<PublicKey> = agents.iter().map(|a| a.pubkey).collect();
+        let thirty_days_ago = Timestamp::from(
+            Timestamp::now().as_u64().saturating_sub(30 * 24 * 60 * 60),
+        );
         let event_filter = if author_pks.is_empty() {
-            nostr_sdk::Filter::new().kind(result_kind)
+            nostr_sdk::Filter::new().kind(result_kind).since(thirty_days_ago)
         } else {
-            nostr_sdk::Filter::new().kind(result_kind).authors(author_pks)
+            nostr_sdk::Filter::new()
+                .kind(result_kind)
+                .authors(author_pks)
+                .since(thirty_days_ago)
         };
         let events = self
             .agent
             .client
-            .fetch_events(
-                vec![event_filter],
-                Some(std::time::Duration::from_secs(timeout_secs)),
-            )
+            .fetch_events(vec![event_filter], fetch_timeout)
             .await;
 
         // 3. Accumulate earnings per provider (only agents in this network)
-        let mut earnings: HashMap<String, u64> = HashMap::new();
+        let mut earnings: HashMap<&str, u64> = HashMap::new();
         let event_list = match &events {
             Ok(ev) => ev.iter().collect::<Vec<_>>(),
             Err(_) => vec![],
         };
         let mut total_job_results = 0usize;
         for event in event_list.iter() {
-            let npub = event.pubkey.to_bech32().unwrap_or_default();
-            if !agent_npubs.contains(&npub) {
-                continue;
-            }
+            let npub = match pk_to_npub.get(&event.pubkey) {
+                Some(n) => n.as_str(),
+                None => continue, // not an agent in this network
+            };
             total_job_results += 1;
             let amount = event.tags.iter().find_map(|tag| {
                 let s = tag.as_slice();
@@ -292,28 +295,22 @@ impl ElisymServer {
             .iter()
             .filter(|a| !a.card.capabilities.is_empty())
             .map(|a| {
-                let npub = a.pubkey.to_bech32().unwrap_or_default();
-                let earned = earnings.get(&npub).copied().unwrap_or(0);
-                let (price, token) = a
+                let npub = pk_to_npub.get(&a.pubkey).cloned().unwrap_or_default();
+                let earned = earnings.get(npub.as_str()).copied().unwrap_or(0);
+                let price = a
                     .card
                     .metadata
                     .as_ref()
-                    .map(|m| {
-                        let p = m["job_price"].as_u64().unwrap_or(0);
-                        let t = m["token"].as_str().unwrap_or("sol").to_string();
-                        (p, t)
-                    })
-                    .unwrap_or((0, "sol".into()));
+                    .and_then(|m| m["job_price"].as_u64())
+                    .unwrap_or(0);
                 let price_str = if price == 0 {
                     "—".into()
-                } else if token == "usdc" {
-                    format!("{:.6} USDC", price as f64 / 1_000_000.0)
                 } else {
                     format!("{:.4} SOL", price as f64 / 1_000_000_000.0)
                 };
                 AgentRow {
                     name: a.card.name.clone(),
-                    npub: npub[..npub.len().min(20)].to_string(),
+                    npub: truncate_str(&npub, 20),
                     capabilities: a.card.capabilities.join(", "),
                     price: price_str,
                     earned,
@@ -328,7 +325,7 @@ impl ElisymServer {
         let mut output = String::new();
         output.push_str(&format!(
             "elisym Network Dashboard ({}/{})\n\
-             Agents: {}  |  Total Earned: {:.4} SOL  |  Job Results: {}\n\n",
+             Agents: {}  |  Total Earned (30d): {:.4} SOL  |  Job Results: {}\n\n",
             filter_chain,
             filter_network,
             agents.len(),
@@ -420,7 +417,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Wait for and retrieve the result of a previously submitted job request. Subscribes to NIP-90 results and waits up to the specified timeout.")]
+    #[tool(description = "Wait for and retrieve the result of a previously submitted job request. Subscribes to NIP-90 results and waits up to the specified timeout. Note: only captures results arriving after this tool is called — if the provider already responded, the result may be missed. Use submit_and_pay_job for a race-free flow.")]
     async fn get_job_result(
         &self,
         Parameters(input): Parameters<GetJobResultInput>,
@@ -482,7 +479,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Wait for job feedback (PaymentRequired, Processing, Error, etc.) on a previously submitted job. Returns the first feedback event matching the job ID.")]
+    #[tool(description = "Wait for job feedback (PaymentRequired, Processing, Error, etc.) on a previously submitted job. Returns the first feedback event matching the job ID. Note: only captures feedback arriving after this tool is called. Use submit_and_pay_job for a race-free flow.")]
     async fn get_job_feedback(
         &self,
         Parameters(input): Parameters<GetJobFeedbackInput>,
@@ -618,8 +615,20 @@ impl ElisymServer {
         // 3. Event loop: handle feedback and results
         loop {
             tokio::select! {
-                Some(fb) = feedback_rx.recv(), if !paid => {
+                Some(fb) = feedback_rx.recv() => {
                     if fb.request_id != event_id {
+                        continue;
+                    }
+                    // Always handle errors, even after payment
+                    if fb.status.as_str() == "error" {
+                        let info = fb.extra_info.as_deref().unwrap_or("unknown error");
+                        status_log.push(format!("Provider error: {info}"));
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            status_log.join("\n")
+                        )]));
+                    }
+                    // Skip non-error feedback after payment
+                    if paid {
                         continue;
                     }
                     match fb.status.as_str() {
@@ -663,13 +672,6 @@ impl ElisymServer {
                         }
                         "processing" => {
                             status_log.push("Provider is processing the job...".into());
-                        }
-                        "error" => {
-                            let info = fb.extra_info.as_deref().unwrap_or("unknown error");
-                            status_log.push(format!("Provider error: {info}"));
-                            return Ok(CallToolResult::error(vec![Content::text(
-                                status_log.join("\n")
-                            )]));
                         }
                         other => {
                             status_log.push(format!("Feedback: {other}"));
@@ -892,24 +894,28 @@ impl ElisymServer {
     fn send_payment(
         &self,
         Parameters(input): Parameters<SendPaymentInput>,
-    ) -> String {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
-            return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
+            )]));
         };
 
         // Validate fee params before paying — prevent provider from tampering
         if let Some(err) = validate_payment_fee(&input.payment_request) {
-            return format!("Fee validation failed: {err}");
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Fee validation failed: {err}"
+            ))]));
         }
 
         match provider.pay(&input.payment_request) {
-            Ok(result) => {
-                format!(
-                    "Payment sent successfully.\nTransaction: {}\nStatus: {}",
-                    result.payment_id, result.status
-                )
-            }
-            Err(e) => format!("Payment failed: {e}"),
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Payment sent successfully.\nTransaction: {}\nStatus: {}",
+                result.payment_id, result.status
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Payment failed: {e}"
+            ))])),
         }
     }
 
@@ -946,16 +952,20 @@ impl ElisymServer {
                 let customer_npub = job.customer.to_bech32().unwrap_or_default();
 
                 // Store the raw event for later use in feedback/result.
-                // Cap at 100 entries to prevent unbounded growth; evict oldest.
+                // Cap at 1000 entries to prevent unbounded growth; evict oldest.
                 {
                     let mut map = self.job_events.lock().await;
-                    if map.len() >= 100 {
+                    if map.len() >= 1000 {
                         // Remove the entry with the lowest (oldest) created_at
                         if let Some(oldest_id) = map
                             .iter()
                             .min_by_key(|(_, ev)| ev.created_at)
                             .map(|(id, _)| *id)
                         {
+                            tracing::warn!(
+                                evicted_event = %oldest_id,
+                                "Job events cache full (1000), evicting oldest entry"
+                            );
                             map.remove(&oldest_id);
                         }
                     }
@@ -1090,13 +1100,15 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Generate a Solana payment request with 3% protocol fee to send to a customer (provider mode). Use the returned request string in send_job_feedback with status 'payment-required'.")]
+    #[tool(description = "Generate a Solana payment request with 3% protocol fee to send to a customer (provider mode). Returns a JSON object with the request string to use in send_job_feedback with status 'payment-required'.")]
     fn create_payment_request(
         &self,
         Parameters(input): Parameters<CreatePaymentRequestInput>,
-    ) -> String {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
-            return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
+            )]));
         };
 
         let expiry = input.expiry_secs.unwrap_or(600);
@@ -1110,12 +1122,19 @@ impl ElisymServer {
         ) {
             Ok(req) => {
                 let provider_net = input.amount - fee_amount;
-                format!(
-                    "Payment request created.\nRequest: {}\nAmount: {} lamports (provider net: {}, fee: {})\nChain: {:?}",
-                    req.request, req.amount, provider_net, fee_amount, req.chain
-                )
+                let result = serde_json::json!({
+                    "payment_request": req.request,
+                    "amount_lamports": req.amount,
+                    "provider_net_lamports": provider_net,
+                    "fee_lamports": fee_amount,
+                    "chain": format!("{:?}", req.chain),
+                });
+                let json = serde_json::to_string_pretty(&result).unwrap_or_default();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
             }
-            Err(e) => format!("Error creating payment request: {e}"),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error creating payment request: {e}"
+            ))])),
         }
     }
 
