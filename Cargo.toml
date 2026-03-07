@@ -12,6 +12,7 @@ keywords = ["mcp", "nostr", "ai-agents", "solana", "nip-90"]
 categories = ["network-programming"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 elisym-core = { path = "../elisym-core", features = ["payments-solana"] }
 rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }

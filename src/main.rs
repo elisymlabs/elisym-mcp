@@ -1,13 +1,50 @@
+mod install;
 mod server;
 mod tools;
 
 use anyhow::{Context, Result};
-use elisym_core::{AgentNodeBuilder, SolanaPaymentConfig, SolanaPaymentProvider, SolanaNetwork, SolanaToken};
+use clap::{Parser, Subcommand};
+use elisym_core::{
+    AgentNodeBuilder, SolanaNetwork, SolanaPaymentConfig, SolanaPaymentProvider, SolanaToken,
+};
 use rmcp::{ServiceExt, transport::stdio};
 use serde::Deserialize;
 use tracing_subscriber::{self, EnvFilter};
 
 use server::ElisymServer;
+
+/// elisym MCP server — AI agent discovery, marketplace, and payments via Nostr.
+#[derive(Parser)]
+#[command(name = "elisym-mcp", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Install elisym-mcp into MCP client configurations.
+    Install {
+        /// Target a specific client (claude-desktop, cursor, windsurf).
+        #[arg(long)]
+        client: Option<String>,
+
+        /// Bind to an existing elisym agent (reads ~/.elisym/agents/<name>/config.toml).
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// List detected MCP clients and their status.
+        #[arg(long)]
+        list: bool,
+    },
+
+    /// Remove elisym-mcp from MCP client configurations.
+    Uninstall {
+        /// Target a specific client.
+        #[arg(long)]
+        client: Option<String>,
+    },
+}
 
 /// Minimal subset of elisym-client's AgentConfig — just what we need.
 #[derive(Deserialize)]
@@ -37,9 +74,15 @@ struct PaymentSection {
     solana_secret_key: String,
 }
 
-fn default_chain() -> String { "solana".into() }
-fn default_network() -> String { "devnet".into() }
-fn default_token() -> String { "sol".into() }
+fn default_chain() -> String {
+    "solana".into()
+}
+fn default_network() -> String {
+    "devnet".into()
+}
+fn default_token() -> String {
+    "sol".into()
+}
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
     let home = dirs::home_dir().context("Cannot find home directory")?;
@@ -69,7 +112,7 @@ fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPaymentProvid
 
     let token = match payment.token.as_str() {
         "sol" => SolanaToken::Sol,
-        _ => SolanaToken::Sol, // default to SOL for now
+        _ => SolanaToken::Sol,
     };
 
     let config = SolanaPaymentConfig {
@@ -112,7 +155,29 @@ fn list_agents() -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // MCP servers MUST NOT write to stdout (reserved for JSON-RPC).
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Install {
+            client,
+            agent,
+            list,
+        }) => {
+            if list {
+                install::run_list();
+            } else {
+                install::run_install(client.as_deref(), agent.as_deref())?;
+            }
+            return Ok(());
+        }
+        Some(Commands::Uninstall { client }) => {
+            install::run_uninstall(client.as_deref())?;
+            return Ok(());
+        }
+        None => {}
+    }
+
+    // MCP server mode (default — no subcommand)
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -122,7 +187,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting elisym MCP server");
 
-    // Priority: ELISYM_AGENT (reuse elisym-client config) > individual env vars > defaults
     let builder = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
         let config = load_agent_config(&agent_name)?;
         tracing::info!(agent = %agent_name, "Loading agent from ~/.elisym/agents/");
@@ -135,7 +199,6 @@ async fn main() -> Result<()> {
             b = b.relays(config.relays);
         }
 
-        // Configure Solana payments if available
         if let Some(ref payment) = config.payment {
             if let Some(provider) = build_solana_provider(payment) {
                 b = b.solana_payment_provider(provider);

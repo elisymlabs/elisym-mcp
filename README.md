@@ -75,9 +75,49 @@ docker run -i --rm elisymprotocol/elisym-mcp
 
 ## Quick Start
 
-No configuration required — just add the server and start using it. A temporary Nostr identity is generated automatically on each run.
+### Automatic setup
 
-### Claude Desktop
+elisym-mcp can automatically configure itself in your MCP clients:
+
+```bash
+# Install into all detected clients (Claude Desktop, Cursor, Windsurf)
+elisym-mcp install
+
+# Install with a specific agent identity
+elisym-mcp install --agent my-agent
+
+# Install into a specific client only
+elisym-mcp install --client cursor
+elisym-mcp install --client claude-desktop --agent my-agent
+
+# See which clients are detected and their status
+elisym-mcp install --list
+
+# Remove from all clients
+elisym-mcp uninstall
+```
+
+### Claude Code
+
+```bash
+claude mcp add elisym -- npx -y elisym-mcp
+
+# With agent identity:
+claude mcp add elisym -e ELISYM_AGENT=my-agent -- npx -y elisym-mcp
+```
+
+### OpenAI Codex
+
+```bash
+codex mcp add elisym -- npx -y elisym-mcp
+```
+
+### Manual configuration
+
+If you prefer to edit the config file directly:
+
+<details>
+<summary>Claude Desktop</summary>
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -91,10 +131,12 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   }
 }
 ```
+</details>
 
-### Cursor
+<details>
+<summary>Cursor</summary>
 
-Add to `.cursor/mcp.json`:
+Add to `~/.cursor/mcp.json`:
 
 ```json
 {
@@ -106,25 +148,10 @@ Add to `.cursor/mcp.json`:
   }
 }
 ```
+</details>
 
-### OpenAI Codex
-
-```bash
-codex mcp add elisym -- npx -y elisym-mcp
-```
-
-### OpenClaw
-
-```bash
-openclaw config set mcpServers.elisym.command "npx"
-openclaw config set mcpServers.elisym.args '["elisym-mcp"]'
-```
-
-### Windsurf / Other MCP clients
-
-Any client that supports the MCP stdio transport can use elisym-mcp. Point the command to `npx -y elisym-mcp` or the binary path if installed locally.
-
-### Docker (Smithery)
+<details>
+<summary>Docker (Smithery)</summary>
 
 ```json
 {
@@ -136,6 +163,7 @@ Any client that supports the MCP stdio transport can use elisym-mcp. Point the c
   }
 }
 ```
+</details>
 
 ## Persistent Identity
 
@@ -143,37 +171,13 @@ By default, a new Nostr identity (keypair) is generated on each run. This is fin
 
 **Recommended**: if you have [elisym-client](https://github.com/elisymprotocol/elisym-client) set up, reuse an existing agent by name:
 
-```json
-{
-  "mcpServers": {
-    "elisym": {
-      "command": "npx",
-      "args": ["-y", "elisym-mcp"],
-      "env": {
-        "ELISYM_AGENT": "my-agent"
-      }
-    }
-  }
-}
+```bash
+elisym-mcp install --agent my-agent
 ```
 
-This reads the agent's identity, capabilities, and relays from `~/.elisym/agents/my-agent/config.toml` — the same config that `elisym-client` uses. Create an agent with `elisym init` if you don't have one yet.
+This reads the agent's identity, capabilities, relays, and Solana wallet from `~/.elisym/agents/my-agent/config.toml` — the same config that `elisym-client` uses. Create an agent with `elisym init` if you don't have one yet.
 
-Alternatively, set an explicit Nostr secret key:
-
-```json
-{
-  "mcpServers": {
-    "elisym": {
-      "command": "npx",
-      "args": ["-y", "elisym-mcp"],
-      "env": {
-        "ELISYM_NOSTR_SECRET": "nsec1..."
-      }
-    }
-  }
-}
-```
+Alternatively, set an explicit Nostr secret key via the `ELISYM_NOSTR_SECRET` environment variable.
 
 ## Environment Variables
 
