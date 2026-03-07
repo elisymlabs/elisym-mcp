@@ -28,6 +28,20 @@ fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// Check if an MCP client app is installed on this machine (macOS only).
+fn is_app_installed(client_name: &str) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let app_name = match client_name {
+        "claude-desktop" => "Claude",
+        "cursor" => "Cursor",
+        "windsurf" => "Windsurf",
+        _ => return false,
+    };
+    PathBuf::from(format!("/Applications/{app_name}.app")).exists()
+}
+
 fn claude_desktop_config() -> Option<PathBuf> {
     let home = home()?;
     if cfg!(target_os = "macos") {
@@ -196,22 +210,7 @@ pub fn run_list() {
                 }
             } else {
                 // Config file doesn't exist — check if the app itself is installed
-                let app_exists = match client.name {
-                    "claude-desktop" => {
-                        cfg!(target_os = "macos")
-                            && PathBuf::from("/Applications/Claude.app").exists()
-                    }
-                    "cursor" => {
-                        cfg!(target_os = "macos")
-                            && PathBuf::from("/Applications/Cursor.app").exists()
-                    }
-                    "windsurf" => {
-                        cfg!(target_os = "macos")
-                            && PathBuf::from("/Applications/Windsurf.app").exists()
-                    }
-                    _ => false,
-                };
-                if app_exists {
+                if is_app_installed(client.name) {
                     "available (no config file yet)"
                 } else {
                     continue; // Skip — app not installed
@@ -253,25 +252,8 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(Str
         };
 
         // If no filter, only install to clients that have a config file or app installed
-        if client_filter.is_none() && !path.exists() {
-            let app_exists = match client.name {
-                "claude-desktop" => {
-                    cfg!(target_os = "macos")
-                        && PathBuf::from("/Applications/Claude.app").exists()
-                }
-                "cursor" => {
-                    cfg!(target_os = "macos")
-                        && PathBuf::from("/Applications/Cursor.app").exists()
-                }
-                "windsurf" => {
-                    cfg!(target_os = "macos")
-                        && PathBuf::from("/Applications/Windsurf.app").exists()
-                }
-                _ => false,
-            };
-            if !app_exists {
-                continue;
-            }
+        if client_filter.is_none() && !path.exists() && !is_app_installed(client.name) {
+            continue;
         }
 
         match install_to_config(&path, agent, env) {
@@ -280,7 +262,10 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(Str
                 installed += 1;
             }
             Ok(false) => {
-                println!("  Already installed in {} ({})", client.name, path.display());
+                println!(
+                    "  Already installed in {} ({}). To update, run: elisym-mcp uninstall && elisym-mcp install ...",
+                    client.name, path.display()
+                );
                 skipped += 1;
             }
             Err(e) => {

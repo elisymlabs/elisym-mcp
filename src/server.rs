@@ -178,7 +178,7 @@ impl ElisymServer {
     }
 
     #[tool(description = "Get this agent's identity — public key (npub), name, description, and capabilities.")]
-    fn get_identity(&self) -> String {
+    fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let info = AgentInfo {
             npub: self.agent.identity.npub(),
             name: self.agent.capability_card.name.clone(),
@@ -186,8 +186,9 @@ impl ElisymServer {
             capabilities: self.agent.capability_card.capabilities.clone(),
             supported_kinds: vec![DEFAULT_KIND_OFFSET],
         };
-        serde_json::to_string_pretty(&info)
-            .unwrap_or_else(|e| format!("Error serializing identity: {e}"))
+        let json = serde_json::to_string_pretty(&info)
+            .unwrap_or_else(|e| format!("Error serializing identity: {e}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(description = "Get a snapshot of the elisym network — top agents ranked by earnings, with total protocol earnings. Shows agent name, capabilities, price, and earned amount.")]
@@ -875,18 +876,24 @@ impl ElisymServer {
     // ══════════════════════════════════════════════════════════════
 
     #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL. Requires Solana payments to be configured via ELISYM_AGENT.")]
-    fn get_balance(&self) -> String {
+    fn get_balance(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
-            return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
+            )]));
         };
 
         let address = provider.address();
         match provider.balance() {
             Ok(lamports) => {
                 let sol = lamports as f64 / 1_000_000_000.0;
-                format!("Address: {address}\nBalance: {sol:.9} SOL ({lamports} lamports)")
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Address: {address}\nBalance: {sol:.9} SOL ({lamports} lamports)"
+                ))]))
             }
-            Err(e) => format!("Address: {address}\nError fetching balance: {e}"),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Address: {address}\nError fetching balance: {e}"
+            ))])),
         }
     }
 
@@ -1142,9 +1149,11 @@ impl ElisymServer {
     fn check_payment_status(
         &self,
         Parameters(input): Parameters<CheckPaymentStatusInput>,
-    ) -> String {
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
-            return "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.".to_string();
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
+            )]));
         };
 
         match provider.lookup_payment(&input.payment_request) {
@@ -1154,9 +1163,13 @@ impl ElisymServer {
                     .amount
                     .map(|a| format!("\nAmount: {a} lamports"))
                     .unwrap_or_default();
-                format!("Settled: {settled}{amount_info}")
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Settled: {settled}{amount_info}"
+                ))]))
             }
-            Err(e) => format!("Error checking payment: {e}"),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error checking payment: {e}"
+            ))])),
         }
     }
 

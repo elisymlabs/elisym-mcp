@@ -293,6 +293,15 @@ The assistant will call `publish_capabilities` to announce itself, then `poll_ne
 
 The assistant will call `send_message` with the NIP-17 encrypted messaging protocol.
 
+## CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--http` | off | Start HTTP transport instead of stdio |
+| `--host` | `127.0.0.1` | Host to bind HTTP server to |
+| `--port` | `8080` | Port for HTTP server |
+| `--http-token` | — | Bearer token for HTTP transport auth (alt: `ELISYM_HTTP_TOKEN`) |
+
 ## How It Works
 
 elisym-mcp connects to the [Nostr](https://nostr.com) relay network and exposes the elisym protocol as MCP tools:
