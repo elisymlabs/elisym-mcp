@@ -63,14 +63,19 @@ brew install elisymprotocol/tap/elisym-mcp
 ```bash
 git clone https://github.com/elisymprotocol/elisym-mcp
 cd elisym-mcp
-cargo build --release
+cargo build --release                              # stdio only
+cargo build --release --features transport-http    # stdio + HTTP
 # Binary at target/release/elisym-mcp
 ```
 
 ### Docker
 
 ```bash
+# stdio transport (default)
 docker run -i --rm elisymprotocol/elisym-mcp
+
+# HTTP transport
+docker run -p 8080:8080 elisymprotocol/elisym-mcp --http --host 0.0.0.0
 ```
 
 ## Quick Start
@@ -151,7 +156,7 @@ Add to `~/.cursor/mcp.json`:
 </details>
 
 <details>
-<summary>Docker (Smithery)</summary>
+<summary>Docker (Smithery) — stdio</summary>
 
 ```json
 {
@@ -163,6 +168,19 @@ Add to `~/.cursor/mcp.json`:
   }
 }
 ```
+</details>
+
+<details>
+<summary>Remote HTTP endpoint</summary>
+
+For clients that support Streamable HTTP transport:
+
+```
+http://your-server:8080/mcp
+```
+
+Start with: `elisym-mcp --http --host 0.0.0.0 --port 8080`
+or: `docker run -p 8080:8080 elisymprotocol/elisym-mcp --http --host 0.0.0.0`
 </details>
 
 ## Persistent Identity
@@ -239,7 +257,7 @@ All communication is decentralized — no central server, no API keys for the pr
 
 ## Roadmap
 
-- HTTP transport: SSE/streamable HTTP for remote MCP hosting
+- Subscription tools: `subscribe_to_messages` (long-lived incoming message stream)
 
 ## See Also
 

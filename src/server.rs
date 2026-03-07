@@ -49,6 +49,19 @@ impl ElisymServer {
         }
     }
 
+    /// Create from shared state (used by HTTP transport factory).
+    #[cfg(feature = "transport-http")]
+    pub fn from_shared(
+        agent: Arc<AgentNode>,
+        job_events: Arc<Mutex<HashMap<EventId, Event>>>,
+    ) -> Self {
+        Self {
+            agent,
+            job_events,
+            tool_router: Self::tool_router(),
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════
     // Discovery tools
     // ══════════════════════════════════════════════════════════════

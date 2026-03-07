@@ -19,6 +19,18 @@ use server::ElisymServer;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Start HTTP transport instead of stdio (requires transport-http feature).
+    #[arg(long)]
+    http: bool,
+
+    /// Host to bind HTTP server to (default: 127.0.0.1).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port for HTTP server (default: 8080).
+    #[arg(long, default_value = "8080")]
+    port: u16,
 }
 
 #[derive(Subcommand)]
@@ -153,6 +165,63 @@ fn list_agents() -> Vec<String> {
     names
 }
 
+#[cfg(feature = "transport-http")]
+async fn start_http_server(
+    agent: elisym_core::AgentNode,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::local::LocalSessionManager,
+    };
+
+    let agent = Arc::new(agent);
+    let job_events = Arc::new(Mutex::new(HashMap::new()));
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig {
+        stateful_mode: true,
+        cancellation_token: ct.clone(),
+        ..Default::default()
+    };
+
+    let agent_clone = Arc::clone(&agent);
+    let job_events_clone = Arc::clone(&job_events);
+
+    let service: StreamableHttpService<ElisymServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(ElisymServer::from_shared(
+                Arc::clone(&agent_clone),
+                Arc::clone(&job_events_clone),
+            )),
+            Default::default(),
+            config,
+        );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+
+    let bind_addr = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("Cannot bind to {bind_addr}"))?;
+
+    tracing::info!(address = %bind_addr, endpoint = "/mcp", "HTTP transport started");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutting down HTTP server");
+            ct.cancel();
+        })
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -244,13 +313,26 @@ async fn main() -> Result<()> {
         "Agent node started"
     );
 
-    let server = ElisymServer::new(agent);
-    let service = server
-        .serve(stdio())
-        .await
-        .inspect_err(|e| tracing::error!("Failed to start MCP service: {e}"))?;
+    if cli.http {
+        #[cfg(feature = "transport-http")]
+        {
+            start_http_server(agent, &cli.host, cli.port).await?;
+        }
+        #[cfg(not(feature = "transport-http"))]
+        {
+            anyhow::bail!(
+                "HTTP transport not available. Rebuild with: cargo build --features transport-http"
+            );
+        }
+    } else {
+        let server = ElisymServer::new(agent);
+        let service = server
+            .serve(stdio())
+            .await
+            .inspect_err(|e| tracing::error!("Failed to start MCP service: {e}"))?;
 
-    service.waiting().await?;
+        service.waiting().await?;
+    }
 
     tracing::info!("elisym MCP server stopped");
     Ok(())
