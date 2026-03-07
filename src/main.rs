@@ -9,6 +9,8 @@ use elisym_core::{
     AgentNodeBuilder, SolanaNetwork, SolanaPaymentConfig, SolanaPaymentProvider,
 };
 use rmcp::{ServiceExt, transport::stdio};
+use nostr_sdk::ToBech32;
+use solana_sdk::signature::Signer as _;
 use serde::Deserialize;
 use tracing_subscriber::{self, EnvFilter};
 
@@ -73,6 +75,32 @@ enum Commands {
         /// Target a specific client.
         #[arg(long)]
         client: Option<String>,
+    },
+
+    /// Create a new agent identity (generates Nostr keypair + config).
+    Init {
+        /// Agent name (used as directory name under ~/.elisym/agents/).
+        name: String,
+
+        /// Agent description.
+        #[arg(long, default_value = "elisym MCP agent")]
+        description: Option<String>,
+
+        /// Capabilities (comma-separated).
+        #[arg(long, default_value = "mcp-gateway")]
+        capabilities: Option<String>,
+
+        /// Encrypt secret keys with a password (AES-256-GCM + Argon2id).
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Solana network: devnet, testnet, mainnet (default: devnet).
+        #[arg(long, default_value = "devnet")]
+        network: Option<String>,
+
+        /// Auto-install into MCP clients after creating the agent.
+        #[arg(long)]
+        install: bool,
     },
 }
 
@@ -221,6 +249,134 @@ fn list_agents() -> Vec<String> {
     names
 }
 
+fn run_init(
+    name: &str,
+    description: Option<&str>,
+    capabilities: Option<&str>,
+    password: Option<&str>,
+    network: &str,
+) -> Result<()> {
+    // Validate agent name (same rules as load_agent_config)
+    anyhow::ensure!(
+        !name.is_empty()
+            && !name.contains('/')
+            && !name.contains('\\')
+            && name != "."
+            && name != "..",
+        "Invalid agent name: '{name}'"
+    );
+
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let agent_dir = home.join(".elisym").join("agents").join(name);
+    let config_path = agent_dir.join("config.toml");
+
+    if config_path.exists() {
+        anyhow::bail!(
+            "Agent '{}' already exists at {}",
+            name,
+            config_path.display()
+        );
+    }
+
+    // Generate Nostr keypair
+    let keys = nostr_sdk::Keys::generate();
+    let secret_hex = keys.secret_key().to_secret_hex();
+    let npub = keys.public_key().to_bech32().unwrap_or_default();
+
+    // Generate Solana keypair
+    let sol_keypair = solana_sdk::signature::Keypair::new();
+    let sol_secret_b58 = bs58::encode(sol_keypair.to_bytes()).into_string();
+    let sol_address = sol_keypair.pubkey().to_string();
+
+    let desc = description.unwrap_or("elisym MCP agent");
+    let caps: Vec<&str> = capabilities
+        .unwrap_or("mcp-gateway")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Build config TOML
+    let caps_toml: Vec<String> = caps.iter().map(|c| format!("\"{}\"", c)).collect();
+    let mut config_content = format!(
+        r#"name = "{name}"
+description = "{desc}"
+capabilities = [{caps}]
+relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
+"#,
+        name = name,
+        desc = desc,
+        caps = caps_toml.join(", "),
+    );
+
+    let encrypted = if let Some(pw) = password {
+        let bundle = crypto::SecretsBundle {
+            nostr_secret_key: secret_hex,
+            solana_secret_key: sol_secret_b58,
+        };
+        let enc = crypto::encrypt_secrets(&bundle, pw)
+            .context("Failed to encrypt secrets")?;
+
+        config_content.push_str(&format!(
+            r#"
+[payment]
+chain = "solana"
+network = "{network}"
+
+[encryption]
+ciphertext = "{}"
+salt = "{}"
+nonce = "{}"
+"#,
+            enc.ciphertext, enc.salt, enc.nonce,
+        ));
+        true
+    } else {
+        config_content.push_str(&format!(
+            r#"secret_key = "{secret_hex}"
+
+[payment]
+chain = "solana"
+network = "{network}"
+solana_secret_key = "{sol_secret_b58}"
+"#
+        ));
+        false
+    };
+
+    // Create directory and write config
+    std::fs::create_dir_all(&agent_dir)
+        .with_context(|| format!("Cannot create {}", agent_dir.display()))?;
+    std::fs::write(&config_path, &config_content)
+        .with_context(|| format!("Cannot write {}", config_path.display()))?;
+
+    // Set permissions to 600 (owner-only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Cannot set permissions on {}", config_path.display()))?;
+    }
+
+    println!("Agent '{}' created.", name);
+    println!("  npub: {}", npub);
+    println!("  solana: {} ({network})", sol_address);
+    println!("  config: {}", config_path.display());
+    if encrypted {
+        println!("  encrypted: yes (AES-256-GCM + Argon2id)");
+    }
+    println!();
+    println!("To use with MCP:");
+    if encrypted {
+        println!("  elisym-mcp install --agent {name} --password <password>");
+    } else {
+        println!("  elisym-mcp install --agent {name}");
+    }
+    println!("  # or: ELISYM_AGENT={name} elisym-mcp");
+
+    Ok(())
+}
+
 #[cfg(feature = "transport-http")]
 async fn start_http_server(
     agent: elisym_core::AgentNode,
@@ -346,6 +502,31 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Uninstall { client }) => {
             install::run_uninstall(client.as_deref())?;
+            return Ok(());
+        }
+        Some(Commands::Init {
+            name,
+            description,
+            capabilities,
+            password,
+            network,
+            install: auto_install,
+        }) => {
+            let net = network.as_deref().unwrap_or("devnet");
+            run_init(
+                &name,
+                description.as_deref(),
+                capabilities.as_deref(),
+                password.as_deref(),
+                net,
+            )?;
+            if auto_install {
+                let mut env = vec![("ELISYM_AGENT".to_string(), name)];
+                if let Some(pw) = password {
+                    env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw));
+                }
+                install::run_install(None, None, &env)?;
+            }
             return Ok(());
         }
         None => {}

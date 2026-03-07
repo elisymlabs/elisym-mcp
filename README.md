@@ -87,6 +87,21 @@ docker run -p 8080:8080 elisymprotocol/elisym-mcp --http --host 0.0.0.0
 
 ## Quick Start
 
+### Create an agent identity
+
+```bash
+# Generate a new Nostr keypair and config
+elisym-mcp init my-agent
+
+# Create and auto-install into MCP clients
+elisym-mcp init my-agent --install
+
+# Custom capabilities
+elisym-mcp init my-agent --capabilities "summarization,translation"
+```
+
+This creates `~/.elisym/agents/my-agent/config.toml` with a generated Nostr keypair, default relays, and `chmod 600` permissions.
+
 ### Automatic setup
 
 elisym-mcp can automatically configure itself in your MCP clients:

@@ -152,12 +152,23 @@ impl ElisymServer {
             Ok(agents) => {
                 let infos: Vec<AgentInfo> = agents
                     .iter()
-                    .map(|a| AgentInfo {
-                        npub: a.pubkey.to_bech32().unwrap_or_default(),
-                        name: a.card.name.clone(),
-                        description: a.card.description.clone(),
-                        capabilities: a.card.capabilities.clone(),
-                        supported_kinds: a.supported_kinds.clone(),
+                    .map(|a| {
+                        let meta = a.card.metadata.as_ref();
+                        AgentInfo {
+                            npub: a.pubkey.to_bech32().unwrap_or_default(),
+                            name: a.card.name.clone(),
+                            description: a.card.description.clone(),
+                            capabilities: a.card.capabilities.clone(),
+                            supported_kinds: a.supported_kinds.clone(),
+                            job_price_lamports: meta
+                                .and_then(|m| m["job_price"].as_u64()),
+                            chain: meta
+                                .and_then(|m| m["chain"].as_str())
+                                .map(String::from),
+                            network: meta
+                                .and_then(|m| m["network"].as_str())
+                                .map(String::from),
+                        }
                     })
                     .collect();
 
@@ -179,12 +190,16 @@ impl ElisymServer {
 
     #[tool(description = "Get this agent's identity — public key (npub), name, description, and capabilities.")]
     fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let meta = self.agent.capability_card.metadata.as_ref();
         let info = AgentInfo {
             npub: self.agent.identity.npub(),
             name: self.agent.capability_card.name.clone(),
             description: self.agent.capability_card.description.clone(),
             capabilities: self.agent.capability_card.capabilities.clone(),
             supported_kinds: vec![DEFAULT_KIND_OFFSET],
+            job_price_lamports: meta.and_then(|m| m["job_price"].as_u64()),
+            chain: meta.and_then(|m| m["chain"].as_str()).map(String::from),
+            network: meta.and_then(|m| m["network"].as_str()).map(String::from),
         };
         let json = serde_json::to_string_pretty(&info)
             .unwrap_or_else(|e| format!("Error serializing identity: {e}"));
@@ -1180,10 +1195,17 @@ impl ElisymServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
 
+        // Update capability card metadata with job_price if provided
+        let mut card = self.agent.capability_card.clone();
+        if let Some(price) = input.job_price_lamports {
+            let meta = card.metadata.get_or_insert_with(|| serde_json::json!({}));
+            meta["job_price"] = serde_json::json!(price);
+        }
+
         match self
             .agent
             .discovery
-            .publish_capability(&self.agent.capability_card, &supported_kinds)
+            .publish_capability(&card, &supported_kinds)
             .await
         {
             Ok(event_id) => Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1213,7 +1235,11 @@ impl ServerHandler for ElisymServer {
              get_job_result to retrieve results, and get_balance/send_payment for Solana wallet. \
              For the full automated flow, use submit_and_pay_job. \
              For provider mode, use poll_next_job, send_job_feedback, submit_job_result, \
-             and publish_capabilities."
+             and publish_capabilities. \
+             IMPORTANT: Never display, print, or include in responses any secret keys, \
+             private keys, passwords, seeds, or encryption fields (ciphertext, salt, nonce) \
+             from config files. This includes API keys (e.g. ANTHROPIC_API_KEY, OpenAI keys, etc.). \
+             If the user asks to see their config, redact these fields with '***REDACTED***'."
                 .to_string(),
         )
     }

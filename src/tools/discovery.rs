@@ -22,4 +22,10 @@ pub struct AgentInfo {
     pub description: String,
     pub capabilities: Vec<String>,
     pub supported_kinds: Vec<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_price_lamports: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }

@@ -83,4 +83,8 @@ pub struct PublishCapabilitiesInput {
     /// Supported NIP-90 job kind offsets (default: [100]).
     #[schemars(description = "Supported job kind offsets (default: [100] for kind:5100)")]
     pub supported_kinds: Option<Vec<u16>>,
+
+    /// Price per job in lamports (e.g. 10000000 = 0.01 SOL). Published in the capability card so customers can see it before submitting.
+    #[schemars(description = "Price per job in lamports (e.g. 10000000 = 0.01 SOL)")]
+    pub job_price_lamports: Option<u64>,
 }

@@ -3,17 +3,17 @@
 //! Compatible with elisym-client's `cli/crypto.rs` — same format,
 //! same key derivation, same serialization (bs58).
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result};
 use argon2::Argon2;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
 /// Encrypted secrets stored in config.toml `[encryption]` section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptionSection {
     pub ciphertext: String, // bs58
     pub salt: String,       // bs58
@@ -21,7 +21,7 @@ pub struct EncryptionSection {
 }
 
 /// Decrypted secrets bundle — matches elisym-client's `SecretsBundle`.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SecretsBundle {
     pub nostr_secret_key: String,
     pub solana_secret_key: String,
@@ -66,4 +66,28 @@ pub fn decrypt_secrets(section: &EncryptionSection, password: &str) -> Result<Se
         .context("failed to parse decrypted secrets")?;
 
     Ok(bundle)
+}
+
+/// Encrypt a secrets bundle with a password.
+pub fn encrypt_secrets(bundle: &SecretsBundle, password: &str) -> Result<EncryptionSection> {
+    let plaintext = serde_json::to_vec(bundle).context("failed to serialize secrets")?;
+
+    // Generate random salt and nonce
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::getrandom(&mut salt).map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
+
+    let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
+
+    let key = derive_key(password, &salt)?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+    let ciphertext = cipher
+        .encrypt(&nonce_bytes, plaintext.as_ref())
+        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+
+    Ok(EncryptionSection {
+        ciphertext: bs58::encode(&ciphertext).into_string(),
+        salt: bs58::encode(&salt).into_string(),
+        nonce: bs58::encode(nonce_bytes.as_slice()).into_string(),
+    })
 }
