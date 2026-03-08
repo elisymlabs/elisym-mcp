@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use elisym_core::{
     AgentFilter, AgentNode, PaymentProvider,
-    DEFAULT_KIND_OFFSET, KIND_JOB_RESULT_BASE, kind,
+    DEFAULT_KIND_OFFSET, KIND_JOB_FEEDBACK, KIND_JOB_RESULT_BASE, kind,
 };
 use nostr_sdk::prelude::*;
 use rmcp::{
@@ -729,7 +729,7 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Wait for job feedback (PaymentRequired, Processing, Error, etc.) on a previously submitted job. Returns the first feedback event matching the job ID. Note: only captures feedback arriving after this tool is called. Use submit_and_pay_job for a race-free flow.")]
+    #[tool(description = "Retrieve job feedback (PaymentRequired, Processing, Error, etc.) on a previously submitted job. First checks relays for existing feedback, then subscribes to live feedback and waits up to the specified timeout.")]
     async fn get_job_feedback(
         &self,
         Parameters(input): Parameters<GetJobFeedbackInput>,
@@ -739,20 +739,66 @@ impl ElisymServer {
         }
         let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
-        let mut rx = match self.agent.marketplace.subscribe_to_feedback().await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error subscribing to feedback: {e}"
-                ))]))
-            }
-        };
-
         let target_id = match EventId::parse(&input.job_event_id) {
             Ok(id) => id,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Invalid event ID: {e}"
+                ))]))
+            }
+        };
+
+        // 1. Historical fetch — check if feedback already exists on relays
+        let historical_filter = nostr_sdk::Filter::new()
+            .kind(Kind::from(KIND_JOB_FEEDBACK))
+            .event(target_id);
+        let fetch_timeout = tokio::time::Duration::from_secs(5);
+        if let Ok(events) = self
+            .agent
+            .client
+            .fetch_events(vec![historical_filter], Some(fetch_timeout))
+            .await
+        {
+            for event in events.iter() {
+                let has_matching_e_tag = event.tags.iter().any(|tag| {
+                    let t = tag.as_slice();
+                    t.len() >= 2 && t[0] == "e" && t[1] == target_id.to_hex()
+                });
+                if has_matching_e_tag {
+                    let mut parts = Vec::new();
+                    for tag in event.tags.iter() {
+                        let t = tag.as_slice();
+                        if t.len() >= 2 && t[0] == "status" {
+                            parts.push(format!("Status: {}", t[1]));
+                            if let Some(info) = t.get(2) {
+                                parts.push(format!("Info: {info}"));
+                            }
+                        }
+                        if t.len() >= 3 && t[0] == "amount" {
+                            if let Some(pr) = t.get(2) {
+                                parts.push(format!("Payment request: {pr}"));
+                            }
+                            if let Some(chain) = t.get(3) {
+                                parts.push(format!("Payment chain: {chain}"));
+                            }
+                        }
+                    }
+                    if parts.is_empty() {
+                        parts.push("Feedback event found (no status tag)".to_string());
+                    }
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        parts.join("\n"),
+                    )]));
+                }
+            }
+        }
+
+        // 2. Live subscription — wait for feedback in real time
+        let mut rx = match self.agent.marketplace.subscribe_to_feedback().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error subscribing to feedback: {e}"
                 ))]))
             }
         };
