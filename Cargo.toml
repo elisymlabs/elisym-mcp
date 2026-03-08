@@ -35,5 +35,6 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 bs58 = "0.5"
 getrandom = "0.2"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 solana-sdk = "2.2"

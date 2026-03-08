@@ -8,7 +8,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, Result};
 use argon2::{Argon2, Params};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -30,7 +30,7 @@ pub struct EncryptionSection {
 }
 
 /// Decrypted secrets bundle — matches elisym-client's `SecretsBundle`.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SecretsBundle {
     pub nostr_secret_key: String,
     pub solana_secret_key: String,

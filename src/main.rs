@@ -11,7 +11,7 @@ use elisym_core::{
 use rmcp::{ServiceExt, transport::stdio};
 use nostr_sdk::ToBech32;
 use solana_sdk::signature::Signer as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::{self, EnvFilter};
 
 use server::ElisymServer;
@@ -153,11 +153,12 @@ fn default_payment_timeout() -> u32 {
 }
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
-    // Reject path traversal attempts (e.g. "../" or "/")
+    // Reject path traversal attempts (e.g. "../" or "/") and hidden dirs (e.g. ".hidden")
     anyhow::ensure!(
         !name.is_empty()
             && !name.contains('/')
             && !name.contains('\\')
+            && !name.starts_with('.')
             && name != "."
             && name != "..",
         "Invalid agent name: '{name}'"
@@ -202,9 +203,9 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
         })?;
         let bundle = crypto::decrypt_secrets(enc, &password)
             .with_context(|| format!("Failed to decrypt secrets for agent '{}'", name))?;
-        config.secret_key = bundle.nostr_secret_key;
+        config.secret_key = bundle.nostr_secret_key.clone();
         if let Some(ref mut payment) = config.payment {
-            payment.solana_secret_key = bundle.solana_secret_key;
+            payment.solana_secret_key = bundle.solana_secret_key.clone();
         }
         tracing::info!("Decrypted agent secrets");
     }
@@ -272,6 +273,7 @@ fn run_init(
         !name.is_empty()
             && !name.contains('/')
             && !name.contains('\\')
+            && !name.starts_with('.')
             && name != "."
             && name != "..",
         "Invalid agent name: '{name}'"
@@ -307,20 +309,41 @@ fn run_init(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Build config TOML
-    let caps_toml: Vec<String> = caps.iter().map(|c| format!("\"{}\"", c)).collect();
-    let mut config_content = format!(
-        r#"name = "{name}"
-description = "{desc}"
-capabilities = [{caps}]
-relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
-"#,
-        name = name,
-        desc = desc,
-        caps = caps_toml.join(", "),
-    );
+    // Build config using proper TOML serialization (prevents injection via user input)
+    #[derive(Serialize)]
+    struct InitConfig {
+        name: String,
+        description: String,
+        capabilities: Vec<String>,
+        relays: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret_key: Option<String>,
+        payment: InitPayment,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encryption: Option<InitEncryption>,
+    }
+    #[derive(Serialize)]
+    struct InitPayment {
+        chain: String,
+        network: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        solana_secret_key: Option<String>,
+    }
+    #[derive(Serialize)]
+    struct InitEncryption {
+        ciphertext: String,
+        salt: String,
+        nonce: String,
+    }
 
-    let encrypted = if let Some(pw) = password {
+    let caps_vec: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
+    let relays = vec![
+        "wss://relay.damus.io".into(),
+        "wss://nos.lol".into(),
+        "wss://relay.nostr.band".into(),
+    ];
+
+    let (secret_key_field, sol_key_field, encryption_field, encrypted) = if let Some(pw) = password {
         let bundle = crypto::SecretsBundle {
             nostr_secret_key: secret_hex,
             solana_secret_key: sol_secret_b58,
@@ -329,33 +352,31 @@ relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
         };
         let enc = crypto::encrypt_secrets(&bundle, pw)
             .context("Failed to encrypt secrets")?;
-
-        config_content.push_str(&format!(
-            r#"
-[payment]
-chain = "solana"
-network = "{network}"
-
-[encryption]
-ciphertext = "{}"
-salt = "{}"
-nonce = "{}"
-"#,
-            enc.ciphertext, enc.salt, enc.nonce,
-        ));
-        true
+        (None, None, Some(InitEncryption {
+            ciphertext: enc.ciphertext,
+            salt: enc.salt,
+            nonce: enc.nonce,
+        }), true)
     } else {
-        config_content.push_str(&format!(
-            r#"secret_key = "{secret_hex}"
-
-[payment]
-chain = "solana"
-network = "{network}"
-solana_secret_key = "{sol_secret_b58}"
-"#
-        ));
-        false
+        (Some(secret_hex), Some(sol_secret_b58), None, false)
     };
+
+    let init_config = InitConfig {
+        name: name.to_string(),
+        description: desc.to_string(),
+        capabilities: caps_vec,
+        relays,
+        secret_key: secret_key_field,
+        payment: InitPayment {
+            chain: "solana".into(),
+            network: network.to_string(),
+            solana_secret_key: sol_key_field,
+        },
+        encryption: encryption_field,
+    };
+
+    let config_content = toml::to_string_pretty(&init_config)
+        .context("Failed to serialize config")?;
 
     // Create directory and write config
     std::fs::create_dir_all(&agent_dir)
@@ -444,6 +465,7 @@ async fn start_http_server(
     // Add bearer token auth middleware if configured
     if let Some(token) = http_token {
         use axum::http::StatusCode;
+        use subtle::ConstantTimeEq;
 
         let expected = format!("Bearer {token}");
         router = router.layer(axum::middleware::from_fn(
@@ -455,12 +477,12 @@ async fn start_http_server(
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or_default();
-                    // Note: not constant-time, but network jitter makes timing
-                    // attacks impractical for a local/internal HTTP transport token.
-                    if auth != expected {
-                        return Err(StatusCode::UNAUTHORIZED);
+                    // Constant-time comparison to prevent timing side-channels
+                    if auth.as_bytes().ct_eq(expected.as_bytes()).into() {
+                        Ok(next.run(req).await)
+                    } else {
+                        Err(StatusCode::UNAUTHORIZED)
                     }
-                    Ok(next.run(req).await)
                 }
             },
         ));

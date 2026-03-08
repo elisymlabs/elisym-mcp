@@ -87,9 +87,11 @@ fn validate_payment_fee(request: &str) -> Option<String> {
 
 /// Truncate a string to `max` chars, appending "…" if truncated. UTF-8 safe.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
+    // Single-pass using char_indices instead of iterating chars twice
+    let mut indices = s.char_indices();
+    if indices.nth(max).is_some() {
+        let end = s.char_indices().nth(max.saturating_sub(1)).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}…", &s[..end])
     } else {
         s.to_string()
     }
@@ -270,9 +272,12 @@ impl ElisymServer {
 
         // 3. Accumulate earnings per provider (only agents in this network)
         let mut earnings: HashMap<&str, u64> = HashMap::new();
-        let event_list = match &events {
-            Ok(ev) => ev.iter().collect::<Vec<_>>(),
-            Err(_) => vec![],
+        let (event_list, fetch_warning) = match &events {
+            Ok(ev) => (ev.iter().collect::<Vec<_>>(), None),
+            Err(e) => {
+                tracing::warn!("Failed to fetch job result events: {e}");
+                (vec![], Some(format!("Warning: could not fetch earnings data: {e}")))
+            }
         };
         let mut total_job_results = 0usize;
         for event in event_list.iter() {
@@ -380,6 +385,10 @@ impl ElisymServer {
                     rows.len() - top_n
                 ));
             }
+        }
+
+        if let Some(warning) = fetch_warning {
+            output.push_str(&format!("\n{warning}\n"));
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -890,6 +899,9 @@ impl ElisymServer {
     // Wallet tools
     // ══════════════════════════════════════════════════════════════
 
+    // Note: this is a sync fn that makes a blocking RPC call on the tokio runtime.
+    // Acceptable for now since balance queries are short-lived. Consider spawn_blocking
+    // if latency becomes a concern.
     #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL. Requires Solana payments to be configured via ELISYM_AGENT.")]
     fn get_balance(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(provider) = self.agent.solana_payments() else {
@@ -912,6 +924,7 @@ impl ElisymServer {
         }
     }
 
+    // Note: sync fn with blocking RPC call (see get_balance comment above).
     #[tool(description = "Pay a Solana payment request (from a provider's job feedback). Validates protocol fee before sending. Requires Solana payments to be configured via ELISYM_AGENT.")]
     fn send_payment(
         &self,
@@ -1134,6 +1147,7 @@ impl ElisymServer {
         };
 
         let expiry = input.expiry_secs.unwrap_or(600);
+        // Fee rounds up to nearest lamport (div_ceil favors protocol)
         let fee_amount = (input.amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
         match provider.create_payment_request_with_fee(
             input.amount,
@@ -1210,7 +1224,7 @@ impl ElisymServer {
         {
             Ok(event_id) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Capability card published.\nEvent ID: {event_id}\nName: {}\nCapabilities: {:?}",
-                self.agent.capability_card.name, self.agent.capability_card.capabilities
+                card.name, card.capabilities
             ))])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error publishing capabilities: {e}"
