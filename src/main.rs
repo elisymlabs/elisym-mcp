@@ -131,6 +131,12 @@ struct PaymentSection {
     rpc_url: Option<String>,
     #[serde(default)]
     solana_secret_key: String,
+    #[serde(default = "default_job_price")]
+    #[allow(dead_code)]
+    job_price: u64,
+    #[serde(default = "default_payment_timeout")]
+    #[allow(dead_code)]
+    payment_timeout_secs: u32,
 }
 
 fn default_chain() -> String {
@@ -138,6 +144,12 @@ fn default_chain() -> String {
 }
 fn default_network() -> String {
     "devnet".into()
+}
+fn default_job_price() -> u64 {
+    10_000_000
+}
+fn default_payment_timeout() -> u32 {
+    120
 }
 
 fn load_agent_config(name: &str) -> Result<AgentConfig> {
@@ -200,6 +212,24 @@ fn load_agent_config(name: &str) -> Result<AgentConfig> {
     Ok(config)
 }
 
+fn builder_from_config(config: &AgentConfig) -> AgentNodeBuilder {
+    let mut b = AgentNodeBuilder::new(&config.name, &config.description)
+        .capabilities(config.capabilities.clone())
+        .secret_key(&config.secret_key);
+
+    if !config.relays.is_empty() {
+        b = b.relays(config.relays.clone());
+    }
+
+    if let Some(ref payment) = config.payment {
+        if let Some(provider) = build_solana_provider(payment) {
+            b = b.solana_payment_provider(provider);
+        }
+    }
+
+    b
+}
+
 fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPaymentProvider> {
     if payment.chain != "solana" || payment.solana_secret_key.is_empty() {
         return None;
@@ -229,32 +259,13 @@ fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPaymentProvid
     }
 }
 
-fn list_agents() -> Vec<String> {
-    let Some(home) = dirs::home_dir() else {
-        return vec![];
-    };
-    let root = home.join(".elisym").join("agents");
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return vec![];
-    };
-    let mut names = Vec::new();
-    for entry in entries.flatten() {
-        if entry.path().join("config.toml").exists() {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-    }
-    names.sort();
-    names
-}
-
 fn run_init(
     name: &str,
     description: Option<&str>,
     capabilities: Option<&str>,
     password: Option<&str>,
     network: &str,
+    quiet: bool,
 ) -> Result<()> {
     // Validate agent name (same rules as load_agent_config)
     anyhow::ensure!(
@@ -313,6 +324,8 @@ relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nostr.band"]
         let bundle = crypto::SecretsBundle {
             nostr_secret_key: secret_hex,
             solana_secret_key: sol_secret_b58,
+            llm_api_key: String::new(),
+            customer_llm_api_key: None,
         };
         let enc = crypto::encrypt_secrets(&bundle, pw)
             .context("Failed to encrypt secrets")?;
@@ -358,21 +371,32 @@ solana_secret_key = "{sol_secret_b58}"
             .with_context(|| format!("Cannot set permissions on {}", config_path.display()))?;
     }
 
-    println!("Agent '{}' created.", name);
-    println!("  npub: {}", npub);
-    println!("  solana: {} ({network})", sol_address);
-    println!("  config: {}", config_path.display());
-    if encrypted {
-        println!("  encrypted: yes (AES-256-GCM + Argon2id)");
-    }
-    println!();
-    println!("To use with MCP:");
-    if encrypted {
-        println!("  elisym-mcp install --agent {name} --password <password>");
+    if quiet {
+        tracing::info!(
+            agent = name,
+            npub = %npub,
+            solana = %sol_address,
+            config = %config_path.display(),
+            encrypted,
+            "Agent created"
+        );
     } else {
-        println!("  elisym-mcp install --agent {name}");
+        println!("Agent '{}' created.", name);
+        println!("  npub: {}", npub);
+        println!("  solana: {} ({network})", sol_address);
+        println!("  config: {}", config_path.display());
+        if encrypted {
+            println!("  encrypted: yes (AES-256-GCM + Argon2id)");
+        }
+        println!();
+        println!("To use with MCP:");
+        if encrypted {
+            println!("  elisym-mcp install --agent {name} --password <password>");
+        } else {
+            println!("  elisym-mcp install --agent {name}");
+        }
+        println!("  # or: ELISYM_AGENT={name} elisym-mcp");
     }
-    println!("  # or: ELISYM_AGENT={name} elisym-mcp");
 
     Ok(())
 }
@@ -519,6 +543,7 @@ async fn main() -> Result<()> {
                 capabilities.as_deref(),
                 password.as_deref(),
                 net,
+                false,
             )?;
             if auto_install {
                 let mut env = vec![("ELISYM_AGENT".to_string(), name)];
@@ -545,42 +570,17 @@ async fn main() -> Result<()> {
     let builder = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
         let config = load_agent_config(&agent_name)?;
         tracing::info!(agent = %agent_name, "Loading agent from ~/.elisym/agents/");
-
-        let mut b = AgentNodeBuilder::new(&config.name, &config.description)
-            .capabilities(config.capabilities)
-            .secret_key(&config.secret_key);
-
-        if !config.relays.is_empty() {
-            b = b.relays(config.relays);
-        }
-
-        if let Some(ref payment) = config.payment {
-            if let Some(provider) = build_solana_provider(payment) {
-                b = b.solana_payment_provider(provider);
-            }
-        }
-
-        b
-    } else {
+        builder_from_config(&config)
+    } else if std::env::var("ELISYM_NOSTR_SECRET").is_ok() {
+        // Explicit secret key — ephemeral mode, no auto-persist
         let agent_name =
             std::env::var("ELISYM_AGENT_NAME").unwrap_or_else(|_| "mcp-agent".into());
         let agent_desc = std::env::var("ELISYM_AGENT_DESCRIPTION")
             .unwrap_or_else(|_| "elisym MCP server agent".into());
 
         let mut b = AgentNodeBuilder::new(&agent_name, &agent_desc)
-            .capabilities(vec!["mcp-gateway".into()]);
-
-        if let Ok(key) = std::env::var("ELISYM_NOSTR_SECRET") {
-            b = b.secret_key(key);
-        } else {
-            let agents = list_agents();
-            if !agents.is_empty() {
-                tracing::info!(
-                    "Tip: set ELISYM_AGENT to reuse an existing agent identity. Available: {}",
-                    agents.join(", ")
-                );
-            }
-        }
+            .capabilities(vec!["mcp-gateway".into()])
+            .secret_key(std::env::var("ELISYM_NOSTR_SECRET").unwrap());
 
         if let Ok(relays) = std::env::var("ELISYM_RELAYS") {
             let relay_list: Vec<String> =
@@ -590,6 +590,25 @@ async fn main() -> Result<()> {
             }
         }
         b
+    } else {
+        // No ELISYM_AGENT, no ELISYM_NOSTR_SECRET — auto-persist a default identity
+        let agent_name =
+            std::env::var("ELISYM_AGENT_NAME").unwrap_or_else(|_| "mcp-agent".into());
+
+        // Try loading existing config first, create if missing
+        match load_agent_config(&agent_name) {
+            Ok(config) => {
+                tracing::info!(agent = %agent_name, "Reusing persisted agent identity");
+                builder_from_config(&config)
+            }
+            Err(_) => {
+                tracing::info!(agent = %agent_name, "Creating new agent identity");
+                run_init(&agent_name, None, None, None, "devnet", true)?;
+                let config = load_agent_config(&agent_name)
+                    .context("Failed to load newly created agent config")?;
+                builder_from_config(&config)
+            }
+        }
     };
 
     let agent = builder.build().await?;
