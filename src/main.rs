@@ -478,6 +478,7 @@ async fn start_http_server(
     };
 
     let agent = Arc::new(agent);
+    server::spawn_ping_responder(Arc::clone(&agent));
     let job_cache = Arc::new(Mutex::new(server::JobEventsCache::new()));
 
     let ct = tokio_util::sync::CancellationToken::new();

@@ -278,11 +278,49 @@ pub struct ElisymServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Spawn a background task that auto-responds to incoming `elisym_ping`
+/// messages with `elisym_pong` (same nonce), so other agents can detect
+/// that this agent is online.
+pub fn spawn_ping_responder(agent: Arc<AgentNode>) {
+    tokio::spawn(async move {
+        let mut rx = match agent.messaging.subscribe_to_messages().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!("Ping responder: failed to subscribe to messages: {e}");
+                return;
+            }
+        };
+        tracing::debug!("Ping responder started");
+        while let Some(msg) = rx.recv().await {
+            let hb: HeartbeatMessage = match serde_json::from_str::<HeartbeatMessage>(&msg.content) {
+                Ok(hb) if hb.msg_type == "elisym_ping" => hb,
+                _ => continue,
+            };
+            let pong = HeartbeatMessage {
+                msg_type: "elisym_pong".into(),
+                nonce: hb.nonce,
+            };
+            if let Err(e) = agent
+                .messaging
+                .send_structured_message(&msg.sender, &pong)
+                .await
+            {
+                tracing::warn!("Ping responder: failed to send pong: {e}");
+            } else {
+                tracing::debug!(sender = %msg.sender, "Ping responder: sent pong");
+            }
+        }
+        tracing::debug!("Ping responder stopped");
+    });
+}
+
 #[tool_router]
 impl ElisymServer {
     pub fn new(agent: AgentNode) -> Self {
+        let agent = Arc::new(agent);
+        spawn_ping_responder(Arc::clone(&agent));
         Self {
-            agent: Arc::new(agent),
+            agent,
             job_cache: Arc::new(Mutex::new(JobEventsCache::new())),
             tool_router: Self::tool_router(),
         }
