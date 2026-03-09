@@ -1,6 +1,6 @@
 [package]
 name = "elisym-mcp"
-version = "0.1.10"
+version = "0.2.10"
 edition = "2021"
 rust-version = "1.80"
 description = "MCP server for the elisym protocol — AI agent discovery, marketplace, and payments via Nostr"
@@ -29,6 +29,7 @@ schemars = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nostr-sdk = "0.37"
+regex = "1"
 toml = "0.8"
 dirs = "6"
 anyhow = "1"

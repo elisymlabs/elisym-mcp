@@ -1,5 +1,6 @@
 mod crypto;
 mod install;
+mod sanitize;
 mod server;
 mod tools;
 
