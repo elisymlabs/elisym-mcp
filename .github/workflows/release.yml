@@ -270,7 +270,7 @@ jobs:
 
           for i in "${!platforms[@]}"; do
             plat="${platforms[$i]}"
-            pkg_name="@elisymprotocol/elisym-mcp-${plat}"
+            pkg_name="@elisym/elisym-mcp-${plat}"
             pkg_dir="npm-staging/${plat}"
 
             mkdir -p "$pkg_dir"
@@ -312,4 +312,4 @@ jobs:
             }
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
-          npm publish || echo "Skipped wrapper (may already exist)"
+          npm publish --access public || echo "Skipped wrapper (may already exist)"

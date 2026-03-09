@@ -7,10 +7,10 @@ const fs = require("fs");
 const BINARY = "elisym-mcp";
 
 const PLATFORM_PACKAGES = {
-  "darwin-arm64": `@elisymprotocol/elisym-mcp-darwin-arm64`,
-  "darwin-x64": `@elisymprotocol/elisym-mcp-darwin-x64`,
-  "linux-x64": `@elisymprotocol/elisym-mcp-linux-x64`,
-  "linux-arm64": `@elisymprotocol/elisym-mcp-linux-arm64`,
+  "darwin-arm64": `@elisym/elisym-mcp-darwin-arm64`,
+  "darwin-x64": `@elisym/elisym-mcp-darwin-x64`,
+  "linux-x64": `@elisym/elisym-mcp-linux-x64`,
+  "linux-arm64": `@elisym/elisym-mcp-linux-arm64`,
 };
 
 function getBinaryPath() {
