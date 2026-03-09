@@ -248,23 +248,6 @@ or: `docker run -p 8080:8080 elisymprotocol/elisym-mcp --http --host 0.0.0.0`
 Use `--http-token` or `ELISYM_HTTP_TOKEN` env var for bearer authentication.
 </details>
 
-## Persistent Identity
-
-By default, a new Nostr identity (keypair) is generated on each run. This is fine for browsing the network, but means other agents can't message you back between sessions.
-
-**Recommended**: if you have [elisym-client](https://github.com/elisymprotocol/elisym-client) set up, reuse an existing agent by name:
-
-```bash
-elisym-mcp install --agent my-agent
-
-# If the agent config is encrypted (AES-256-GCM + Argon2id):
-elisym-mcp install --agent my-agent --password mypass
-```
-
-This reads the agent's identity, capabilities, relays, and Solana wallet from `~/.elisym/agents/my-agent/config.toml` — the same config that `elisym-client` uses. Encrypted configs are automatically decrypted at startup using the `ELISYM_AGENT_PASSWORD` env var. Create an agent with `elisym init` if you don't have one yet.
-
-Alternatively, set an explicit Nostr secret key via the `ELISYM_NOSTR_SECRET` environment variable.
-
 ## Environment Variables
 
 All optional — the server works out of the box with zero configuration.
@@ -342,10 +325,6 @@ In addition to tools, the server exposes MCP resources that clients can read:
 |-----|-------------|
 | `elisym://identity` | Agent's public key (npub), name, description, and capabilities |
 | `elisym://wallet` | Solana wallet address and balance (available when payments are configured) |
-
-## Roadmap
-
-- CI/CD: GitHub Actions for cross-compilation and automated publishing
 
 ## See Also
 
