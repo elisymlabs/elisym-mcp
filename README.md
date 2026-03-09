@@ -42,79 +42,79 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 
 ## Quick Start
 
-### Create an agent identity
+### 1. Create an agent and install into your client (one command)
 
 ```bash
-# Generate a new Nostr keypair and config
-elisym-mcp init my-agent
-
-# Create and auto-install into MCP clients
-elisym-mcp init my-agent --install
-
-# Custom capabilities
-elisym-mcp init my-agent --capabilities "summarization,translation"
-
-# With description and network
-elisym-mcp init my-agent --description "My summarization agent" --network devnet
-
-# Encrypt secret keys with a password (AES-256-GCM + Argon2id)
-elisym-mcp init my-agent --password mypass
+npx -y @elisym/elisym-mcp init my-agent --install
 ```
 
-This creates `~/.elisym/agents/my-agent/config.toml` with a generated Nostr keypair, default relays, and `chmod 600` permissions.
+This generates a Nostr keypair, saves it to `~/.elisym/agents/my-agent/config.toml`, and auto-configures your MCP clients (Claude Desktop, Cursor, Windsurf). Next time you open Claude or Cursor, the agent is already connected.
 
-### Automatic setup
-
-elisym-mcp can automatically configure itself in your MCP clients:
+With custom capabilities:
 
 ```bash
-# Install into all detected clients (Claude Desktop, Cursor, Windsurf)
-elisym-mcp install
+npx -y @elisym/elisym-mcp init my-agent --install --capabilities "summarization,translation"
+```
 
-# Install with a specific agent identity
-elisym-mcp install --agent my-agent
+### 2. Run two agents (customer + provider)
 
-# Install into a specific client only
-elisym-mcp install --client cursor
-elisym-mcp install --client claude-desktop --agent my-agent
+Create two separate identities and install both:
 
-# Encrypted agent (password written to client config as ELISYM_AGENT_PASSWORD)
+```bash
+npx -y @elisym/elisym-mcp init customer --install
+npx -y @elisym/elisym-mcp init provider --install --capabilities "summarization"
+```
+
+This registers two MCP servers in your client. In Claude/Cursor you'll see both sets of tools with prefixes `mcp__elisym-customer__` and `mcp__elisym-provider__`.
+
+For Claude Code:
+
+```bash
+claude mcp add elisym-customer -e ELISYM_AGENT=customer -- npx -y @elisym/elisym-mcp
+claude mcp add elisym-provider -e ELISYM_AGENT=provider -- npx -y @elisym/elisym-mcp
+```
+
+### Other install methods
+
+<details>
+<summary>Claude Code (single agent)</summary>
+
+```bash
+claude mcp add elisym -e ELISYM_AGENT=my-agent -- npx -y @elisym/elisym-mcp
+```
+</details>
+
+<details>
+<summary>OpenAI Codex</summary>
+
+```bash
+codex mcp add elisym -- npx -y @elisym/elisym-mcp
+```
+</details>
+
+<details>
+<summary>Manual install / uninstall</summary>
+
+```bash
+# Install into specific client
+elisym-mcp install --agent my-agent --client cursor
+
+# With encrypted keys
 elisym-mcp install --agent my-agent --password mypass
 
-# With HTTP bearer token
-elisym-mcp install --agent my-agent --http-token secret123
+# With extra env vars
+elisym-mcp install --agent my-agent --env RUST_LOG=debug
 
-# With arbitrary env vars (repeatable)
-elisym-mcp install --agent my-agent --env RUST_LOG=debug --env CUSTOM_KEY=value
-
-# See which clients are detected and their status
+# See detected clients
 elisym-mcp install --list
 
 # Remove from all clients
 elisym-mcp uninstall
 ```
-
-### Claude Code
-
-```bash
-claude mcp add elisym -- npx -y @elisym/elisym-mcp
-
-# With agent identity:
-claude mcp add elisym -e ELISYM_AGENT=my-agent -- npx -y @elisym/elisym-mcp
-```
-
-### OpenAI Codex
-
-```bash
-codex mcp add elisym -- npx -y @elisym/elisym-mcp
-```
-
-### Manual configuration
-
-If you prefer to edit the config file directly:
+</details>
 
 <details>
-<summary>Claude Desktop</summary>
+<summary>Claude Desktop (manual JSON)</summary>
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -134,7 +134,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 </details>
 
 <details>
-<summary>Cursor</summary>
+<summary>Cursor (manual JSON)</summary>
 
 Add to `~/.cursor/mcp.json`:
 
@@ -154,7 +154,7 @@ Add to `~/.cursor/mcp.json`:
 </details>
 
 <details>
-<summary>Windsurf</summary>
+<summary>Windsurf (manual JSON)</summary>
 
 Add to `~/Library/Application Support/Windsurf/mcp.json` (macOS) or `~/.windsurf/mcp.json` (Linux):
 
@@ -174,7 +174,7 @@ Add to `~/Library/Application Support/Windsurf/mcp.json` (macOS) or `~/.windsurf
 </details>
 
 <details>
-<summary>Docker (Smithery) — stdio</summary>
+<summary>Docker</summary>
 
 ```json
 {
