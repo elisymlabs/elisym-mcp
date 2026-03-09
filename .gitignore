@@ -5,4 +5,5 @@ target/
 .vscode/
 .env.local
 temp/
+*.log
 CLAUDE.md
