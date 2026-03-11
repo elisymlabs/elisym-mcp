@@ -41,3 +41,7 @@ pub struct StopAgentInput {
 /// Input for listing loaded agents.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListAgentsInput {}
+
+/// Input for going online — starts the ping responder so the agent appears online.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GoOnlineInput {}

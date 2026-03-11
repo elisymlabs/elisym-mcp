@@ -225,7 +225,7 @@ fn run_init_wizard() -> Result<()> {
 
 #[cfg(feature = "transport-http")]
 async fn start_http_server(
-    agent: elisym_core::AgentNode,
+    builder: elisym_core::AgentNodeBuilder,
     host: &str,
     port: u16,
     http_token: Option<String>,
@@ -237,15 +237,22 @@ async fn start_http_server(
         session::local::LocalSessionManager,
     };
 
+    // Build agent eagerly for HTTP transport (shared across sessions)
+    let agent = builder.build().await?;
     let agent_name = agent.capability_card.name.clone();
     let agent = Arc::new(agent);
-    let ping_handle = server::spawn_ping_responder(Arc::clone(&agent));
+    tracing::info!(
+        npub = %agent.identity.npub(),
+        payments = agent.payments.is_some(),
+        "Agent node started (HTTP transport)"
+    );
     let job_cache = Arc::new(Mutex::new(server::JobEventsCache::new()));
 
     let mut registry = std::collections::HashMap::new();
     registry.insert(agent_name.clone(), server::AgentEntry {
         node: Arc::clone(&agent),
-        ping_handle,
+        ping_handle: tokio::spawn(async {}),
+        ping_active: false,
     });
     let agent_registry = Arc::new(std::sync::RwLock::new(registry));
     let active_agent_name = Arc::new(std::sync::RwLock::new(agent_name));
@@ -257,7 +264,6 @@ async fn start_http_server(
         ..Default::default()
     };
 
-    let agent_clone = Arc::clone(&agent);
     let registry_clone = Arc::clone(&agent_registry);
     let active_clone = Arc::clone(&active_agent_name);
     let job_cache_clone = Arc::clone(&job_cache);
@@ -265,7 +271,6 @@ async fn start_http_server(
     let service: StreamableHttpService<ElisymServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(ElisymServer::from_shared(
-                Arc::clone(&agent_clone),
                 Arc::clone(&registry_clone),
                 Arc::clone(&active_clone),
                 Arc::clone(&job_cache_clone),
@@ -446,10 +451,10 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting elisym MCP server");
 
-    let builder = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
+    let (agent_name, builder) = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
         let config = load_agent_config(&agent_name)?;
         tracing::info!(agent = %agent_name, "Loading agent from ~/.elisym/agents/");
-        builder_from_config(&config)
+        (agent_name, builder_from_config(&config))
     } else if std::env::var("ELISYM_NOSTR_SECRET").is_ok() {
         // Explicit secret key — ephemeral mode, no auto-persist
         let agent_name =
@@ -469,34 +474,27 @@ async fn main() -> Result<()> {
                 b = b.relays(relay_list);
             }
         }
-        b
+        (agent_name, b)
     } else {
         // No ELISYM_AGENT, no ELISYM_NOSTR_SECRET — auto-persist a default identity
         let agent_name =
             std::env::var("ELISYM_AGENT_NAME").unwrap_or_else(|_| "mcp-agent".into());
 
         // Try loading existing config first, create if missing
-        match load_agent_config(&agent_name) {
+        let config = match load_agent_config(&agent_name) {
             Ok(config) => {
                 tracing::info!(agent = %agent_name, "Reusing persisted agent identity");
-                builder_from_config(&config)
+                config
             }
             Err(_) => {
                 tracing::info!(agent = %agent_name, "Creating new agent identity");
                 run_init(&agent_name, None, None, None, "devnet", true)?;
-                let config = load_agent_config(&agent_name)
-                    .context("Failed to load newly created agent config")?;
-                builder_from_config(&config)
+                load_agent_config(&agent_name)
+                    .context("Failed to load newly created agent config")?
             }
-        }
+        };
+        (agent_name, builder_from_config(&config))
     };
-
-    let agent = builder.build().await?;
-    tracing::info!(
-        npub = %agent.identity.npub(),
-        payments = agent.payments.is_some(),
-        "Agent node started"
-    );
 
     if cli.http {
         #[cfg(feature = "transport-http")]
@@ -507,7 +505,7 @@ async fn main() -> Result<()> {
             let http_token = cli
                 .http_token
                 .or_else(|| std::env::var("ELISYM_HTTP_TOKEN").ok());
-            start_http_server(agent, &cli.host, cli.port, http_token).await?;
+            start_http_server(builder, &cli.host, cli.port, http_token).await?;
         }
         #[cfg(not(feature = "transport-http"))]
         {
@@ -516,7 +514,7 @@ async fn main() -> Result<()> {
             );
         }
     } else {
-        let server = ElisymServer::new(agent);
+        let server = ElisymServer::new(agent_name, builder);
         let service = server
             .serve(stdio())
             .await

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::agent_config;
-use crate::tools::agent::{CreateAgentInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
+use crate::tools::agent::{CreateAgentInput, GoOnlineInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
 use crate::tools::customer::{GetJobFeedbackInput, PingAgentInput, SubmitAndPayJobInput};
 use crate::tools::dashboard::GetDashboardInput;
 use crate::tools::discovery::{AgentInfo, SearchAgentsInput};
@@ -295,11 +295,12 @@ static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
 pub struct AgentEntry {
     pub node: Arc<AgentNode>,
     pub ping_handle: tokio::task::JoinHandle<()>,
+    pub ping_active: bool,
 }
 
 pub struct ElisymServer {
-    /// Currently active agent (used by all tools).
-    agent: Arc<AgentNode>,
+    /// Builder for lazy agent initialization. Consumed on first tool call.
+    pending_builder: Arc<tokio::sync::Mutex<Option<(String, elisym_core::AgentNodeBuilder)>>>,
     /// Registry of all loaded agents (keyed by name). Agents run independently.
     agent_registry: Arc<std::sync::RwLock<HashMap<String, AgentEntry>>>,
     /// Name of the currently active agent.
@@ -347,21 +348,11 @@ pub fn spawn_ping_responder(agent: Arc<AgentNode>) -> tokio::task::JoinHandle<()
 
 #[tool_router]
 impl ElisymServer {
-    pub fn new(agent: AgentNode) -> Self {
-        let name = agent.capability_card.name.clone();
-        let agent = Arc::new(agent);
-        let ping_handle = spawn_ping_responder(Arc::clone(&agent));
-
-        let mut registry = HashMap::new();
-        registry.insert(name.clone(), AgentEntry {
-            node: Arc::clone(&agent),
-            ping_handle,
-        });
-
+    pub fn new(agent_name: String, builder: elisym_core::AgentNodeBuilder) -> Self {
         Self {
-            agent: Arc::clone(&agent),
-            agent_registry: Arc::new(std::sync::RwLock::new(registry)),
-            active_agent_name: Arc::new(std::sync::RwLock::new(name)),
+            pending_builder: Arc::new(tokio::sync::Mutex::new(Some((agent_name, builder)))),
+            agent_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            active_agent_name: Arc::new(std::sync::RwLock::new(String::new())),
             job_cache: Arc::new(Mutex::new(JobEventsCache::new())),
             tool_router: Self::tool_router(),
         }
@@ -370,13 +361,12 @@ impl ElisymServer {
     /// Create from shared state (used by HTTP transport factory).
     #[cfg(feature = "transport-http")]
     pub fn from_shared(
-        agent: Arc<AgentNode>,
         agent_registry: Arc<std::sync::RwLock<HashMap<String, AgentEntry>>>,
         active_agent_name: Arc<std::sync::RwLock<String>>,
         job_cache: Arc<Mutex<JobEventsCache>>,
     ) -> Self {
         Self {
-            agent,
+            pending_builder: Arc::new(tokio::sync::Mutex::new(None)),
             agent_registry,
             active_agent_name,
             job_cache,
@@ -384,17 +374,103 @@ impl ElisymServer {
         }
     }
 
-    /// Get the currently active agent from the registry.
-    /// Falls back to the initial agent if the registry lookup fails.
-    fn current_agent(&self) -> Arc<AgentNode> {
-        if let Ok(name) = self.active_agent_name.read() {
-            if let Ok(registry) = self.agent_registry.read() {
-                if let Some(entry) = registry.get(&*name) {
-                    return Arc::clone(&entry.node);
+    /// Lazily build the agent on first tool call. Returns the currently active agent.
+    async fn ensure_agent(&self) -> Result<Arc<AgentNode>, rmcp::ErrorData> {
+        // Fast path: check registry for active agent
+        {
+            if let Ok(name) = self.active_agent_name.read() {
+                if !name.is_empty() {
+                    if let Ok(registry) = self.agent_registry.read() {
+                        if let Some(entry) = registry.get(&*name) {
+                            return Ok(Arc::clone(&entry.node));
+                        }
+                    }
                 }
             }
         }
-        Arc::clone(&self.agent)
+
+        // Slow path: build from pending builder
+        let mut builder_guard = self.pending_builder.lock().await;
+
+        // Double-check after acquiring lock
+        {
+            if let Ok(name) = self.active_agent_name.read() {
+                if !name.is_empty() {
+                    if let Ok(registry) = self.agent_registry.read() {
+                        if let Some(entry) = registry.get(&*name) {
+                            return Ok(Arc::clone(&entry.node));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (name, builder) = builder_guard.take().ok_or_else(|| {
+            rmcp::ErrorData::internal_error(
+                "Agent not initialized. Use create_agent or switch_agent first.",
+                None,
+            )
+        })?;
+
+        let node = builder.build().await.map_err(|e| {
+            rmcp::ErrorData::internal_error(
+                format!("Failed to connect agent: {e}"),
+                None,
+            )
+        })?;
+
+        let agent = Arc::new(node);
+        tracing::info!(
+            npub = %agent.identity.npub(),
+            payments = agent.payments.is_some(),
+            "Agent node started (lazy init)"
+        );
+
+        if let Ok(mut registry) = self.agent_registry.write() {
+            registry.insert(name.clone(), AgentEntry {
+                node: Arc::clone(&agent),
+                ping_handle: tokio::spawn(async {}),
+                ping_active: false,
+            });
+        }
+        if let Ok(mut active) = self.active_agent_name.write() {
+            *active = name;
+        }
+
+        Ok(agent)
+    }
+
+    /// Start the ping responder for the active agent if not already running.
+    /// Returns `true` if it was just started, `false` if already active.
+    fn activate_ping_responder(&self, agent: &Arc<AgentNode>) -> bool {
+        let active_name = self.active_agent_name.read()
+            .ok()
+            .map(|n| n.clone())
+            .unwrap_or_default();
+
+        // Check if already online
+        {
+            if let Ok(registry) = self.agent_registry.read() {
+                if let Some(entry) = registry.get(&active_name) {
+                    if entry.ping_active {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let ping_handle = spawn_ping_responder(Arc::clone(agent));
+
+        if let Ok(mut registry) = self.agent_registry.write() {
+            if let Some(entry) = registry.get_mut(&active_name) {
+                entry.ping_handle.abort();
+                entry.ping_handle = ping_handle;
+                entry.ping_active = true;
+            }
+        }
+
+        tracing::info!(agent = %active_name, "Ping responder started — agent is now online");
+        true
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -418,7 +494,7 @@ impl ElisymServer {
             ..Default::default()
         };
 
-        match self.current_agent().discovery.search_agents(&filter).await {
+        match self.ensure_agent().await?.discovery.search_agents(&filter).await {
             Ok(agents) => {
                 let infos: Vec<AgentInfo> = agents
                     .iter()
@@ -455,8 +531,8 @@ impl ElisymServer {
     }
 
     #[tool(description = "Get this agent's identity — public key (npub), name, description, and capabilities.")]
-    fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let agent = self.current_agent();
+    async fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let agent = self.ensure_agent().await?;
         let pay = agent.capability_card.payment.as_ref();
         let info = AgentInfo {
             npub: agent.identity.npub(),
@@ -489,7 +565,7 @@ impl ElisymServer {
         //    Protocol-level filtering by chain/network is not yet supported in elisym-core.
         // TODO(elisym-core): Add chain/network filter to AgentFilter to avoid fetching all agents.
         let filter = elisym_core::AgentFilter::default();
-        let all_agents = match self.current_agent().discovery.search_agents(&filter).await {
+        let all_agents = match self.ensure_agent().await?.discovery.search_agents(&filter).await {
             Ok(a) => a,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -532,8 +608,8 @@ impl ElisymServer {
                 .authors(author_pks)
                 .since(thirty_days_ago)
         };
-        let events = self
-            .agent
+        let agent = self.ensure_agent().await?;
+        let events = agent
             .client
             .fetch_events(vec![event_filter], fetch_timeout)
             .await;
@@ -711,8 +787,8 @@ impl ElisymServer {
             None => None,
         };
 
-        match self
-            .agent
+        let agent = self.ensure_agent().await?;
+        match agent
             .marketplace
             .submit_job_request(
                 kind_offset,
@@ -781,9 +857,9 @@ impl ElisymServer {
         if let Some(pk) = provider_pk {
             historical_filter = historical_filter.author(pk);
         }
+        let agent = self.ensure_agent().await?;
         let fetch_timeout = tokio::time::Duration::from_secs(5);
-        if let Ok(events) = self
-            .agent
+        if let Ok(events) = agent
             .client
             .fetch_events(vec![historical_filter], Some(fetch_timeout))
             .await
@@ -823,8 +899,7 @@ impl ElisymServer {
         // 2. Live subscription — wait for result in real time
         let expected_providers: Vec<PublicKey> =
             provider_pk.into_iter().collect();
-        let mut rx = match self
-            .agent
+        let mut rx = match agent
             .marketplace
             .subscribe_to_results(&[kind_offset], &expected_providers)
             .await
@@ -894,12 +969,12 @@ impl ElisymServer {
         };
 
         // 1. Historical fetch — check if feedback already exists on relays
+        let agent = self.ensure_agent().await?;
         let historical_filter = nostr_sdk::Filter::new()
             .kind(Kind::from(KIND_JOB_FEEDBACK))
             .event(target_id);
         let fetch_timeout = tokio::time::Duration::from_secs(5);
-        if let Ok(events) = self
-            .agent
+        if let Ok(events) = agent
             .client
             .fetch_events(vec![historical_filter], Some(fetch_timeout))
             .await
@@ -941,7 +1016,7 @@ impl ElisymServer {
         }
 
         // 2. Live subscription — wait for feedback in real time
-        let mut rx = match self.current_agent().marketplace.subscribe_to_feedback().await {
+        let mut rx = match agent.marketplace.subscribe_to_feedback().await {
             Ok(rx) => rx,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1014,7 +1089,7 @@ impl ElisymServer {
         // Hard-fail: if we can't verify the recipient, we refuse to pay.
         let provider_solana_address: String = {
             let filter = AgentFilter::default();
-            let agents = match self.current_agent().discovery.search_agents(&filter).await {
+            let agents = match self.ensure_agent().await?.discovery.search_agents(&filter).await {
                 Ok(a) => a,
                 Err(e) => {
                     return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1060,7 +1135,8 @@ impl ElisymServer {
         }
 
         // 1. Subscribe to feedback and results BEFORE submitting (avoid race)
-        let mut feedback_rx = match self.current_agent().marketplace.subscribe_to_feedback().await {
+        let agent = self.ensure_agent().await?;
+        let mut feedback_rx = match agent.marketplace.subscribe_to_feedback().await {
             Ok(rx) => rx,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1069,8 +1145,7 @@ impl ElisymServer {
             }
         };
 
-        let mut result_rx = match self
-            .agent
+        let mut result_rx = match agent
             .marketplace
             .subscribe_to_results(&[kind_offset], &[provider_pk])
             .await
@@ -1084,8 +1159,7 @@ impl ElisymServer {
         };
 
         // 2. Submit the job
-        let event_id = match self
-            .agent
+        let event_id = match agent
             .marketplace
             .submit_job_request(
                 kind_offset,
@@ -1157,16 +1231,16 @@ impl ElisymServer {
                                         status_log.join("\n")
                                     )]));
                                 }
-                                if self.current_agent().solana_payments().is_none() {
+                                if agent.solana_payments().is_none() {
                                     status_log.push("Payment required but Solana payments not configured.".into());
                                     return Ok(CallToolResult::error(vec![Content::text(
                                         status_log.join("\n")
                                     )]));
                                 }
-                                let agent = self.current_agent();
+                                let pay_agent = Arc::clone(&agent);
                                 let pr = payment_request.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    agent.solana_payments().unwrap().pay(&pr)
+                                    pay_agent.solana_payments().unwrap().pay(&pr)
                                 }).await {
                                     Ok(Ok(result)) => {
                                         status_log.push(format!(
@@ -1178,7 +1252,7 @@ impl ElisymServer {
                                         tracing::info!(event_id = %event_id, payment_id = %result.payment_id, "Payment sent, waiting for result");
 
                                         // Publish payment-completed feedback with tx hash
-                                        if let Err(e) = self.current_agent().marketplace.submit_payment_confirmation(
+                                        if let Err(e) = agent.marketplace.submit_payment_confirmation(
                                             event_id,
                                             &provider_pk,
                                             &result.payment_id,
@@ -1285,7 +1359,8 @@ impl ElisymServer {
         );
 
         // Subscribe to messages BEFORE sending ping
-        let mut msg_rx = match self.current_agent().messaging.subscribe_to_messages().await {
+        let agent = self.ensure_agent().await?;
+        let mut msg_rx = match agent.messaging.subscribe_to_messages().await {
             Ok(rx) => rx,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1299,8 +1374,7 @@ impl ElisymServer {
             nonce: nonce.clone(),
         };
 
-        if let Err(e) = self
-            .agent
+        if let Err(e) = agent
             .messaging
             .send_structured_message(&target, &ping)
             .await
@@ -1365,8 +1439,8 @@ impl ElisymServer {
             }
         };
 
-        match self
-            .agent
+        let agent = self.ensure_agent().await?;
+        match agent
             .messaging
             .send_message(&recipient, &input.message)
             .await
@@ -1389,7 +1463,7 @@ impl ElisymServer {
         let timeout_secs = input.timeout_secs.unwrap_or(30).min(MAX_TIMEOUT_SECS);
         let max_messages = input.max_messages.unwrap_or(10).min(MAX_MESSAGES);
 
-        let mut rx = match self.current_agent().messaging.subscribe_to_messages().await {
+        let mut rx = match self.ensure_agent().await?.messaging.subscribe_to_messages().await {
             Ok(rx) => rx,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1445,7 +1519,7 @@ impl ElisymServer {
 
     #[tool(description = "Get the Solana wallet balance for this agent. Returns the address and balance in SOL. Requires Solana payments to be configured via ELISYM_AGENT.")]
     async fn get_balance(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let agent = self.current_agent();
+        let agent = self.ensure_agent().await?;
         let Some(provider) = agent.solana_payments() else {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
@@ -1483,7 +1557,8 @@ impl ElisymServer {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
 
-        if self.current_agent().solana_payments().is_none() {
+        let agent = self.ensure_agent().await?;
+        if agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
@@ -1495,8 +1570,6 @@ impl ElisymServer {
                 "Fee validation failed: {err}"
             ))]));
         }
-
-        let agent = self.current_agent();
         let payment_request = input.payment_request;
         match tokio::task::spawn_blocking(move || {
             agent.solana_payments().unwrap().pay(&payment_request)
@@ -1527,8 +1600,12 @@ impl ElisymServer {
         let kind_offsets = input.kind_offsets.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
         let timeout_secs = input.timeout_secs.unwrap_or(60).min(MAX_TIMEOUT_SECS);
 
-        let mut rx = match self
-            .agent
+        let agent = self.ensure_agent().await?;
+
+        // Auto-start ping responder when polling — provider should be discoverable
+        self.activate_ping_responder(&agent);
+
+        let mut rx = match agent
             .marketplace
             .subscribe_to_job_requests(&kind_offsets)
             .await
@@ -1611,7 +1688,7 @@ impl ElisymServer {
             )]));
         }
 
-        let agent = self.current_agent();
+        let agent = self.ensure_agent().await?;
 
         let mut job_sub = if listen_jobs {
             match agent.marketplace.subscribe_to_job_requests(&kind_offsets).await {
@@ -1719,7 +1796,7 @@ impl ElisymServer {
                         None => std::future::pending().await,
                     }
                 } => {
-                    let pay_agent = self.current_agent();
+                    let pay_agent = Arc::clone(&agent);
                     if pay_agent.solana_payments().is_some() {
                         for pr in &pending_payments {
                             let pr_clone = pr.clone();
@@ -1816,8 +1893,8 @@ impl ElisymServer {
             None
         };
 
-        match self
-            .agent
+        let agent = self.ensure_agent().await?;
+        match agent
             .marketplace
             .submit_job_feedback(
                 &raw_event,
@@ -1867,8 +1944,8 @@ impl ElisymServer {
             }
         };
 
-        match self
-            .agent
+        let agent = self.ensure_agent().await?;
+        match agent
             .marketplace
             .submit_job_result(&raw_event, &input.content, input.amount)
             .await
@@ -1904,7 +1981,8 @@ impl ElisymServer {
             )]));
         }
 
-        if self.current_agent().solana_payments().is_none() {
+        let agent = self.ensure_agent().await?;
+        if agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
@@ -1918,7 +1996,6 @@ impl ElisymServer {
             .checked_mul(PROTOCOL_FEE_BPS)
             .map(|v| v.div_ceil(10_000))
             .unwrap_or(u64::MAX);
-        let agent = self.current_agent();
         let amount = input.amount;
         let description = input.description;
         match tokio::task::spawn_blocking(move || {
@@ -1960,13 +2037,12 @@ impl ElisymServer {
             return Ok(CallToolResult::error(vec![Content::text(err)]));
         }
 
-        if self.current_agent().solana_payments().is_none() {
+        let agent = self.ensure_agent().await?;
+        if agent.solana_payments().is_none() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
         }
-
-        let agent = self.current_agent();
         let payment_request = input.payment_request;
         match tokio::task::spawn_blocking(move || {
             agent.solana_payments().unwrap().lookup_payment(&payment_request)
@@ -2006,7 +2082,8 @@ impl ElisymServer {
         let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
 
         // Update capability card with MCP server version and payment info
-        let mut card = self.current_agent().capability_card.clone();
+        let agent = self.ensure_agent().await?;
+        let mut card = agent.capability_card.clone();
         card.set_version(env!("CARGO_PKG_VERSION"));
         if let Some(price) = input.job_price_lamports {
             match card.payment {
@@ -2015,7 +2092,7 @@ impl ElisymServer {
                 }
                 None => {
                     // Build PaymentInfo from Solana provider if available
-                    if let Some(solana) = self.current_agent().solana_payments() {
+                    if let Some(solana) = agent.solana_payments() {
                         card.set_payment(elisym_core::PaymentInfo {
                             chain: "solana".to_string(),
                             network: solana.network_name().to_string(),
@@ -2027,8 +2104,7 @@ impl ElisymServer {
             }
         }
 
-        match self
-            .current_agent()
+        match agent
             .discovery
             .publish_capability(&card, &supported_kinds)
             .await
@@ -2084,13 +2160,12 @@ impl ElisymServer {
                         .map(|p| p.address())
                         .unwrap_or_default();
 
-                    let ping_handle = spawn_ping_responder(Arc::clone(&agent));
-
-                    // Add to registry
+                    // Add to registry (ping responder not started — use go_online to start it)
                     if let Ok(mut registry) = self.agent_registry.write() {
                         registry.insert(input.name.clone(), AgentEntry {
                             node: Arc::clone(&agent),
-                            ping_handle,
+                            ping_handle: tokio::spawn(async {}),
+                            ping_active: false,
                         });
                     }
 
@@ -2157,11 +2232,11 @@ impl ElisymServer {
             match builder.build().await {
                 Ok(node) => {
                     let agent = Arc::new(node);
-                    let ping_handle = spawn_ping_responder(Arc::clone(&agent));
                     if let Ok(mut registry) = self.agent_registry.write() {
                         registry.insert(input.name.clone(), AgentEntry {
                             node: Arc::clone(&agent),
-                            ping_handle,
+                            ping_handle: tokio::spawn(async {}),
+                            ping_active: false,
                         });
                     }
                     agent
@@ -2279,6 +2354,30 @@ impl ElisymServer {
             ))])),
         }
     }
+
+    #[tool(description = "Go online — start the ping responder so this agent appears online on the network and responds to ping heartbeats. Without this, the agent works normally but won't respond to ping_agent checks from other agents.")]
+    async fn go_online(
+        &self,
+        Parameters(_input): Parameters<GoOnlineInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let agent = self.ensure_agent().await?;
+        let active_name = self.active_agent_name.read()
+            .ok()
+            .map(|n| n.clone())
+            .unwrap_or_default();
+
+        if self.activate_ping_responder(&agent) {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Agent '{}' is now online. Responding to ping heartbeats.",
+                active_name
+            ))]))
+        } else {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Agent '{}' is already online.",
+                active_name
+            ))]))
+        }
+    }
 }
 
 #[tool_handler]
@@ -2319,7 +2418,18 @@ impl ServerHandler for ElisymServer {
         .with_mime_type("application/json")
         .no_annotation()];
 
-        if self.current_agent().solana_payments().is_some() {
+        // Only show wallet resource if agent is loaded and has Solana payments
+        let has_wallet = {
+            if let Ok(name) = self.active_agent_name.read() {
+                if !name.is_empty() {
+                    if let Ok(registry) = self.agent_registry.read() {
+                        registry.get(&*name).is_some_and(|e| e.node.solana_payments().is_some())
+                    } else { false }
+                } else { false }
+            } else { false }
+        };
+
+        if has_wallet {
             resources.push(
                 RawResource::new("elisym://wallet", "Solana Wallet".to_string())
                     .with_description("Solana wallet address and balance")
@@ -2343,7 +2453,7 @@ impl ServerHandler for ElisymServer {
         let uri = &request.uri;
         match uri.as_str() {
             "elisym://identity" => {
-                let agent = self.current_agent();
+                let agent = self.ensure_agent().await?;
                 let identity = serde_json::json!({
                     "npub": agent.identity.npub(),
                     "name": agent.capability_card.name,
@@ -2358,7 +2468,7 @@ impl ServerHandler for ElisymServer {
                 )]))
             }
             "elisym://wallet" => {
-                let agent = self.current_agent();
+                let agent = self.ensure_agent().await?;
                 let Some(provider) = agent.solana_payments() else {
                     return Err(rmcp::ErrorData::resource_not_found(
                         "Solana payments not configured",
