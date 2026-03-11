@@ -121,7 +121,6 @@ impl JobEventsCache {
 /// Parsed Solana payment request for fee validation.
 #[derive(Debug, Deserialize)]
 struct SolanaPaymentRequestData {
-    #[allow(dead_code)]
     recipient: String,
     amount: u64,
     #[allow(dead_code)]
@@ -130,13 +129,25 @@ struct SolanaPaymentRequestData {
     fee_amount: Option<u64>,
 }
 
-/// Validate that a payment request has the correct protocol fee params.
+/// Validate that a payment request has the correct recipient and protocol fee params.
+/// `expected_recipient` is the provider's Solana address from their capability card.
 /// Returns an error message if invalid, None if OK.
-fn validate_payment_fee(request: &str) -> Option<String> {
+fn validate_payment_fee(request: &str, expected_recipient: Option<&str>) -> Option<String> {
     let data: SolanaPaymentRequestData = match serde_json::from_str(request) {
         Ok(d) => d,
         Err(e) => return Some(format!("Invalid payment request JSON: {e}")),
     };
+
+    // Validate recipient matches the provider's known Solana address
+    if let Some(expected) = expected_recipient {
+        if data.recipient != expected {
+            return Some(format!(
+                "Recipient mismatch: expected {expected}, got {}. \
+                 Provider may be attempting to redirect payment.",
+                data.recipient
+            ));
+        }
+    }
 
     let expected_fee = data
         .amount
@@ -371,21 +382,16 @@ impl ElisymServer {
                 let infos: Vec<AgentInfo> = agents
                     .iter()
                     .map(|a| {
-                        let meta = a.card.metadata.as_ref();
+                        let pay = a.card.payment.as_ref();
                         AgentInfo {
                             npub: a.pubkey.to_bech32().unwrap_or_default(),
                             name: sanitize_field(&a.card.name, 200),
                             description: sanitize_field(&a.card.description, 1000),
                             capabilities: a.card.capabilities.iter().map(|c| sanitize_field(c, 200)).collect(),
                             supported_kinds: a.supported_kinds.clone(),
-                            job_price_lamports: meta
-                                .and_then(|m| m["job_price"].as_u64()),
-                            chain: meta
-                                .and_then(|m| m["chain"].as_str())
-                                .map(String::from),
-                            network: meta
-                                .and_then(|m| m["network"].as_str())
-                                .map(String::from),
+                            job_price_lamports: pay.and_then(|p| p.job_price),
+                            chain: pay.map(|p| p.chain.clone()),
+                            network: pay.map(|p| p.network.clone()),
                         }
                     })
                     .collect();
@@ -408,16 +414,16 @@ impl ElisymServer {
 
     #[tool(description = "Get this agent's identity — public key (npub), name, description, and capabilities.")]
     fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let meta = self.agent.capability_card.metadata.as_ref();
+        let pay = self.agent.capability_card.payment.as_ref();
         let info = AgentInfo {
             npub: self.agent.identity.npub(),
             name: self.agent.capability_card.name.clone(),
             description: self.agent.capability_card.description.clone(),
             capabilities: self.agent.capability_card.capabilities.clone(),
             supported_kinds: vec![DEFAULT_KIND_OFFSET],
-            job_price_lamports: meta.and_then(|m| m["job_price"].as_u64()),
-            chain: meta.and_then(|m| m["chain"].as_str()).map(String::from),
-            network: meta.and_then(|m| m["network"].as_str()).map(String::from),
+            job_price_lamports: pay.and_then(|p| p.job_price),
+            chain: pay.map(|p| p.chain.clone()),
+            network: pay.map(|p| p.network.clone()),
         };
         let json = serde_json::to_string_pretty(&info)
             .unwrap_or_else(|e| format!("Error serializing identity: {e}"));
@@ -450,11 +456,11 @@ impl ElisymServer {
         let agents: Vec<_> = all_agents
             .into_iter()
             .filter(|a| {
-                let chain = a.card.metadata.as_ref()
-                    .and_then(|m| m["chain"].as_str())
+                let chain = a.card.payment.as_ref()
+                    .map(|p| p.chain.as_str())
                     .unwrap_or("solana");
-                let network = a.card.metadata.as_ref()
-                    .and_then(|m| m["network"].as_str())
+                let network = a.card.payment.as_ref()
+                    .map(|p| p.network.as_str())
                     .unwrap_or("devnet");
                 chain.eq_ignore_ascii_case(&filter_chain)
                     && network.eq_ignore_ascii_case(&filter_network)
@@ -538,9 +544,9 @@ impl ElisymServer {
                 let earned = earnings.get(npub.as_str()).copied().unwrap_or(0);
                 let price = a
                     .card
-                    .metadata
+                    .payment
                     .as_ref()
-                    .and_then(|m| m["job_price"].as_u64())
+                    .and_then(|p| p.job_price)
                     .unwrap_or(0);
                 let price_str = if price == 0 {
                     "—".into()
@@ -705,11 +711,32 @@ impl ElisymServer {
             }
         };
 
+        // Parse optional provider filter
+        let provider_pk = match &input.provider_npub {
+            Some(npub) => {
+                if let Err(err) = check_len("provider_npub", npub, MAX_NPUB_LEN) {
+                    return Ok(CallToolResult::error(vec![Content::text(err)]));
+                }
+                match PublicKey::from_bech32(npub) {
+                    Ok(pk) => Some(pk),
+                    Err(e) => {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Invalid provider npub: {e}"
+                        ))]))
+                    }
+                }
+            }
+            None => None,
+        };
+
         // 1. Historical fetch — check if the result already exists on relays
         let result_kind = Kind::from(KIND_JOB_RESULT_BASE + kind_offset);
-        let historical_filter = nostr_sdk::Filter::new()
+        let mut historical_filter = nostr_sdk::Filter::new()
             .kind(result_kind)
             .event(target_id);
+        if let Some(pk) = provider_pk {
+            historical_filter = historical_filter.author(pk);
+        }
         let fetch_timeout = tokio::time::Duration::from_secs(5);
         if let Ok(events) = self
             .agent
@@ -750,10 +777,12 @@ impl ElisymServer {
         }
 
         // 2. Live subscription — wait for result in real time
+        let expected_providers: Vec<PublicKey> =
+            provider_pk.into_iter().collect();
         let mut rx = match self
             .agent
             .marketplace
-            .subscribe_to_results(&[kind_offset], &[])
+            .subscribe_to_results(&[kind_offset], &expected_providers)
             .await
         {
             Ok(rx) => rx,
@@ -937,6 +966,34 @@ impl ElisymServer {
             }
         };
 
+        // Look up provider's Solana address from their capability card for recipient validation.
+        // Hard-fail: if we can't verify the recipient, we refuse to pay.
+        let provider_solana_address: String = {
+            let filter = AgentFilter::default();
+            let agents = match self.agent.discovery.search_agents(&filter).await {
+                Ok(a) => a,
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Cannot verify provider: discovery lookup failed: {e}"
+                    ))]))
+                }
+            };
+            match agents
+                .iter()
+                .find(|a| a.pubkey == provider_pk)
+                .and_then(|a| a.card.payment.as_ref())
+                .map(|p| p.address.clone())
+            {
+                Some(addr) => addr,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Cannot verify provider: no capability card with payment address found. \
+                         Provider must publish a capability card with a Solana address to receive payments."
+                    )]))
+                }
+            }
+        };
+
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
         let tags = input.tags.unwrap_or_default();
@@ -1049,8 +1106,8 @@ impl ElisymServer {
                         "payment-required" => {
                             tracing::info!(event_id = %event_id, "Provider requested payment");
                             if let Some(payment_request) = &fb.payment_request {
-                                // Validate fee before paying
-                                if let Some(err) = validate_payment_fee(payment_request) {
+                                // Validate recipient and fee before paying
+                                if let Some(err) = validate_payment_fee(payment_request, Some(&provider_solana_address)) {
                                     status_log.push(format!("Fee validation failed: {err}"));
                                     return Ok(CallToolResult::error(vec![Content::text(
                                         status_log.join("\n")
@@ -1075,6 +1132,16 @@ impl ElisymServer {
                                         ));
                                         paid = true;
                                         tracing::info!(event_id = %event_id, payment_id = %result.payment_id, "Payment sent, waiting for result");
+
+                                        // Publish payment-completed feedback with tx hash
+                                        if let Err(e) = self.agent.marketplace.submit_payment_confirmation(
+                                            event_id,
+                                            &provider_pk,
+                                            &result.payment_id,
+                                            Some("solana"),
+                                        ).await {
+                                            tracing::warn!(event_id = %event_id, error = %e, "Failed to publish payment confirmation");
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         status_log.push(format!("Payment failed: {e}"));
@@ -1378,8 +1445,8 @@ impl ElisymServer {
             )]));
         }
 
-        // Validate fee params before paying — prevent provider from tampering
-        if let Some(err) = validate_payment_fee(&input.payment_request) {
+        // Validate recipient and fee params before paying — prevent provider from tampering
+        if let Some(err) = validate_payment_fee(&input.payment_request, input.expected_recipient.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Fee validation failed: {err}"
             ))]));
@@ -1511,13 +1578,14 @@ impl ElisymServer {
 
         let status = match input.status.as_str() {
             "payment-required" => elisym_core::JobStatus::PaymentRequired,
+            "payment-completed" => elisym_core::JobStatus::PaymentCompleted,
             "processing" => elisym_core::JobStatus::Processing,
             "error" => elisym_core::JobStatus::Error,
             "success" => elisym_core::JobStatus::Success,
             "partial" => elisym_core::JobStatus::Partial,
             other => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Unknown status: '{other}'. Use: payment-required, processing, error, success, partial"
+                    "Unknown status: '{other}'. Use: payment-required, payment-completed, processing, error, success, partial"
                 ))]))
             }
         };
@@ -1717,11 +1785,25 @@ impl ElisymServer {
         }
         let supported_kinds = input.supported_kinds.unwrap_or_else(|| vec![DEFAULT_KIND_OFFSET]);
 
-        // Update capability card metadata with job_price if provided
+        // Update capability card payment info with job_price if provided
         let mut card = self.agent.capability_card.clone();
         if let Some(price) = input.job_price_lamports {
-            let meta = card.metadata.get_or_insert_with(|| serde_json::json!({}));
-            meta["job_price"] = serde_json::json!(price);
+            match card.payment {
+                Some(ref mut payment) => {
+                    payment.job_price = Some(price);
+                }
+                None => {
+                    // Build PaymentInfo from Solana provider if available
+                    if let Some(solana) = self.agent.solana_payments() {
+                        card.set_payment(elisym_core::PaymentInfo {
+                            chain: "solana".to_string(),
+                            network: solana.network_name().to_string(),
+                            address: solana.address(),
+                            job_price: Some(price),
+                        });
+                    }
+                }
+            }
         }
 
         match self
@@ -1808,7 +1890,7 @@ impl ServerHandler for ElisymServer {
                     "name": self.agent.capability_card.name,
                     "description": self.agent.capability_card.description,
                     "capabilities": self.agent.capability_card.capabilities,
-                    "protocol_version": self.agent.capability_card.protocol_version,
+                    "payment": self.agent.capability_card.payment,
                 });
                 let json = serde_json::to_string_pretty(&identity).unwrap_or_default();
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -1973,7 +2055,7 @@ mod tests {
         let amount = 10_000_000u64;
         let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
-        assert!(validate_payment_fee(&json).is_none());
+        assert!(validate_payment_fee(&json, None).is_none());
     }
 
     #[test]
@@ -1981,7 +2063,7 @@ mod tests {
         let amount = 10_000_000u64;
         let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
         let json = make_payment_json(amount, Some("WrongAddress"), Some(fee));
-        let err = validate_payment_fee(&json).unwrap();
+        let err = validate_payment_fee(&json, None).unwrap();
         assert!(err.contains("Fee address mismatch"));
     }
 
@@ -1989,20 +2071,37 @@ mod tests {
     fn wrong_fee_amount() {
         let amount = 10_000_000u64;
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(1));
-        let err = validate_payment_fee(&json).unwrap();
+        let err = validate_payment_fee(&json, None).unwrap();
         assert!(err.contains("Fee amount mismatch"));
     }
 
     #[test]
     fn missing_fee() {
         let json = make_payment_json(10_000_000, None, None);
-        let err = validate_payment_fee(&json).unwrap();
+        let err = validate_payment_fee(&json, None).unwrap();
         assert!(err.contains("missing protocol fee"));
     }
 
     #[test]
     fn invalid_json() {
-        assert!(validate_payment_fee("not json").is_some());
+        assert!(validate_payment_fee("not json", None).is_some());
+    }
+
+    #[test]
+    fn valid_recipient() {
+        let amount = 10_000_000u64;
+        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
+        assert!(validate_payment_fee(&json, Some("SomeAddress")).is_none());
+    }
+
+    #[test]
+    fn wrong_recipient() {
+        let amount = 10_000_000u64;
+        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
+        let err = validate_payment_fee(&json, Some("DifferentAddress")).unwrap();
+        assert!(err.contains("Recipient mismatch"));
     }
 
     // ── format_sol ──────────────────────────────────────────────────

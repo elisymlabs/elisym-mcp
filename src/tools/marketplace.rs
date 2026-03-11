@@ -36,6 +36,12 @@ pub struct GetJobResultInput {
     #[schemars(description = "Event ID (hex) of the job request")]
     pub job_event_id: String,
 
+    /// Provider npub to accept results from (optional — accept from anyone if omitted).
+    #[schemars(
+        description = "Provider npub (bech32) to filter results by. Only results from this provider will be accepted. Omit to accept from any provider."
+    )]
+    pub provider_npub: Option<String>,
+
     /// NIP-90 job kind offset (default: 100 for kind:6100 result).
     #[schemars(description = "Job kind offset (default 100 for kind:6100)")]
     pub kind_offset: Option<u16>,
