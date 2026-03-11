@@ -116,7 +116,7 @@ fn resolve_command() -> (String, Vec<String>) {
         }
     }
     // Fallback: npx wrapper
-    ("npx".to_string(), vec!["-y".to_string(), "@elisym/elisym-mcp".to_string()])
+    ("npx".to_string(), vec!["-y".to_string(), "@elisym/elisym-mcp@latest".to_string()])
 }
 
 fn build_server_entry(agent: Option<&str>, env: &[(String, String)]) -> Value {
@@ -309,7 +309,7 @@ pub fn run_list() {
     // Other CLI clients
     println!();
     println!("Other CLI clients:");
-    println!("  codex               codex mcp add elisym -- npx -y elisym-mcp");
+    println!("  codex               codex mcp add elisym -- npx -y elisym-mcp@latest");
 }
 
 pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(String, String)]) -> Result<()> {
