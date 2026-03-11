@@ -31,6 +31,13 @@ pub struct SwitchAgentInput {
     pub name: String,
 }
 
+/// Input for stopping a loaded agent (cancels its ping responder so it appears offline).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StopAgentInput {
+    /// Name of the agent to stop.
+    pub name: String,
+}
+
 /// Input for listing loaded agents.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListAgentsInput {}

@@ -239,11 +239,14 @@ async fn start_http_server(
 
     let agent_name = agent.capability_card.name.clone();
     let agent = Arc::new(agent);
-    server::spawn_ping_responder(Arc::clone(&agent));
+    let ping_handle = server::spawn_ping_responder(Arc::clone(&agent));
     let job_cache = Arc::new(Mutex::new(server::JobEventsCache::new()));
 
     let mut registry = std::collections::HashMap::new();
-    registry.insert(agent_name.clone(), Arc::clone(&agent));
+    registry.insert(agent_name.clone(), server::AgentEntry {
+        node: Arc::clone(&agent),
+        ping_handle,
+    });
     let agent_registry = Arc::new(std::sync::RwLock::new(registry));
     let active_agent_name = Arc::new(std::sync::RwLock::new(agent_name));
 

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::agent_config;
-use crate::tools::agent::{CreateAgentInput, ListAgentsInput, SwitchAgentInput};
+use crate::tools::agent::{CreateAgentInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
 use crate::tools::customer::{GetJobFeedbackInput, PingAgentInput, SubmitAndPayJobInput};
 use crate::tools::dashboard::GetDashboardInput;
 use crate::tools::discovery::{AgentInfo, SearchAgentsInput};
@@ -291,11 +291,17 @@ impl RateLimiter {
 /// Shared across all HTTP sessions; for stdio transport this is a single-client process.
 static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
 
+/// An agent entry in the registry, bundling the node with its ping responder handle.
+pub struct AgentEntry {
+    pub node: Arc<AgentNode>,
+    pub ping_handle: tokio::task::JoinHandle<()>,
+}
+
 pub struct ElisymServer {
     /// Currently active agent (used by all tools).
     agent: Arc<AgentNode>,
     /// Registry of all loaded agents (keyed by name). Agents run independently.
-    agent_registry: Arc<std::sync::RwLock<HashMap<String, Arc<AgentNode>>>>,
+    agent_registry: Arc<std::sync::RwLock<HashMap<String, AgentEntry>>>,
     /// Name of the currently active agent.
     active_agent_name: Arc<std::sync::RwLock<String>>,
     /// Stores raw events for received job requests (provider flow).
@@ -306,7 +312,7 @@ pub struct ElisymServer {
 /// Spawn a background task that auto-responds to incoming `elisym_ping`
 /// messages with `elisym_pong` (same nonce), so other agents can detect
 /// that this agent is online.
-pub fn spawn_ping_responder(agent: Arc<AgentNode>) {
+pub fn spawn_ping_responder(agent: Arc<AgentNode>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut rx = match agent.messaging.subscribe_to_messages().await {
             Ok(rx) => rx,
@@ -336,7 +342,7 @@ pub fn spawn_ping_responder(agent: Arc<AgentNode>) {
             }
         }
         tracing::debug!("Ping responder stopped");
-    });
+    })
 }
 
 #[tool_router]
@@ -344,10 +350,13 @@ impl ElisymServer {
     pub fn new(agent: AgentNode) -> Self {
         let name = agent.capability_card.name.clone();
         let agent = Arc::new(agent);
-        spawn_ping_responder(Arc::clone(&agent));
+        let ping_handle = spawn_ping_responder(Arc::clone(&agent));
 
         let mut registry = HashMap::new();
-        registry.insert(name.clone(), Arc::clone(&agent));
+        registry.insert(name.clone(), AgentEntry {
+            node: Arc::clone(&agent),
+            ping_handle,
+        });
 
         Self {
             agent: Arc::clone(&agent),
@@ -362,7 +371,7 @@ impl ElisymServer {
     #[cfg(feature = "transport-http")]
     pub fn from_shared(
         agent: Arc<AgentNode>,
-        agent_registry: Arc<std::sync::RwLock<HashMap<String, Arc<AgentNode>>>>,
+        agent_registry: Arc<std::sync::RwLock<HashMap<String, AgentEntry>>>,
         active_agent_name: Arc<std::sync::RwLock<String>>,
         job_cache: Arc<Mutex<JobEventsCache>>,
     ) -> Self {
@@ -380,12 +389,12 @@ impl ElisymServer {
     fn current_agent(&self) -> Arc<AgentNode> {
         if let Ok(name) = self.active_agent_name.read() {
             if let Ok(registry) = self.agent_registry.read() {
-                if let Some(agent) = registry.get(&*name) {
-                    return Arc::clone(agent);
+                if let Some(entry) = registry.get(&*name) {
+                    return Arc::clone(&entry.node);
                 }
             }
         }
-        self.current_agent()
+        Arc::clone(&self.agent)
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2075,11 +2084,14 @@ impl ElisymServer {
                         .map(|p| p.address())
                         .unwrap_or_default();
 
-                    spawn_ping_responder(Arc::clone(&agent));
+                    let ping_handle = spawn_ping_responder(Arc::clone(&agent));
 
                     // Add to registry
                     if let Ok(mut registry) = self.agent_registry.write() {
-                        registry.insert(input.name.clone(), Arc::clone(&agent));
+                        registry.insert(input.name.clone(), AgentEntry {
+                            node: Arc::clone(&agent),
+                            ping_handle,
+                        });
                     }
 
                     let mut result = format!(
@@ -2125,7 +2137,7 @@ impl ElisymServer {
             .agent_registry
             .read()
             .ok()
-            .and_then(|r| r.get(&input.name).cloned());
+            .and_then(|r| r.get(&input.name).map(|e| Arc::clone(&e.node)));
 
         let agent = if let Some(agent) = already_loaded {
             agent
@@ -2145,9 +2157,12 @@ impl ElisymServer {
             match builder.build().await {
                 Ok(node) => {
                     let agent = Arc::new(node);
-                    spawn_ping_responder(Arc::clone(&agent));
+                    let ping_handle = spawn_ping_responder(Arc::clone(&agent));
                     if let Ok(mut registry) = self.agent_registry.write() {
-                        registry.insert(input.name.clone(), Arc::clone(&agent));
+                        registry.insert(input.name.clone(), AgentEntry {
+                            node: Arc::clone(&agent),
+                            ping_handle,
+                        });
                     }
                     agent
                 }
@@ -2193,10 +2208,10 @@ impl ElisymServer {
         let mut lines = vec!["Loaded agents:".to_string()];
 
         if let Some(ref registry) = registry {
-            for (name, agent) in registry.iter() {
+            for (name, entry) in registry.iter() {
                 let marker = if *name == active_name { " (active)" } else { "" };
-                let npub = agent.identity.npub();
-                let sol = agent
+                let npub = entry.node.identity.npub();
+                let sol = entry.node
                     .solana_payments()
                     .map(|p| format!(" | solana: {}", p.address()))
                     .unwrap_or_default();
@@ -2223,6 +2238,46 @@ impl ElisymServer {
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
         )]))
+    }
+
+    #[tool(description = "Stop a loaded agent. Cancels its ping responder so the agent appears offline on the network. Cannot stop the currently active agent.")]
+    async fn stop_agent(
+        &self,
+        Parameters(input): Parameters<StopAgentInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Prevent stopping the active agent
+        let active = self
+            .active_agent_name
+            .read()
+            .ok()
+            .map(|n| n.clone())
+            .unwrap_or_default();
+        if input.name == active {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Cannot stop the currently active agent. Switch to a different agent first.",
+            )]));
+        }
+
+        // Remove from registry and abort ping responder
+        let entry = self
+            .agent_registry
+            .write()
+            .ok()
+            .and_then(|mut r| r.remove(&input.name));
+
+        match entry {
+            Some(entry) => {
+                entry.ping_handle.abort();
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Agent '{}' stopped. Ping responder cancelled — agent will appear offline.",
+                    input.name
+                ))]))
+            }
+            None => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Agent '{}' is not loaded.",
+                input.name
+            ))])),
+        }
     }
 }
 
