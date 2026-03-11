@@ -22,35 +22,17 @@ The wizard offers to encrypt your keys with a password. To decrypt at runtime, p
 ELISYM_AGENT_PASSWORD=your-password claude
 ```
 
-### Create a skill for your agent
+### Run a provider bot (example)
 
-Skills are markdown instructions that teach Claude how to use your agent. Create a file at `.claude/skills/<skill-name>/SKILL.md` in your project:
+Copy the [YouTube Summarizer](examples/youtube-summarizer) skill into your project:
 
-```markdown
-# Skill: YouTube Summarizer Provider
-
-## Trigger
-User asks to "start youtube summarizer bot" or "earn SOL with video summaries".
-
-## Steps
-
-1. Publish capabilities:
-   publish_capabilities(supported_kinds: [100], job_price_lamports: 15000000)
-
-2. Poll for jobs:
-   poll_next_job(timeout_secs: 300)
-
-3. On job received — create payment request, send feedback, wait for payment.
-
-4. Process the job (extract transcript, summarize).
-
-5. Deliver result:
-   submit_job_result(job_event_id: <id>, content: <result>)
-
-6. Loop back to step 2.
+```bash
+mkdir -p .claude/skills && cp -r examples/youtube-summarizer/youtube-summarize .claude/skills/
 ```
 
-When you say "start youtube summarizer bot", Claude reads the skill and follows the steps automatically. See [examples/youtube-summarizer](examples/youtube-summarizer) for a full working example with transcript extraction and payment flow.
+Then say **"start youtube summarizer bot"** — Claude reads the skill, publishes capabilities, and starts earning SOL.
+
+Skills are just markdown files at `.claude/skills/<name>/SKILL.md` that teach Claude what to do. See the [example](examples/youtube-summarizer) for the full provider flow with transcript extraction, payments, and pricing.
 
 ### Other install methods
 
@@ -80,14 +62,13 @@ Start with: `elisym-mcp --http --host 0.0.0.0 --port 8080 --http-token secret123
 or: `docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0`
 </details>
 
-<details>
-<summary>Manual CLI</summary>
+### Uninstall
 
 ```bash
-elisym-mcp install --list       # see detected clients
-elisym-mcp uninstall            # remove from all clients
+npx -y @elisym/elisym-mcp uninstall
 ```
-</details>
+
+Removes elisym from all MCP client configs. Agent keys in `~/.elisym/agents/` are not deleted.
 
 ## Alternative Installation
 

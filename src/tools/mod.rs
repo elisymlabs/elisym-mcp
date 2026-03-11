@@ -4,5 +4,6 @@ pub mod dashboard;
 pub mod discovery;
 pub mod marketplace;
 pub mod messaging;
+pub mod poll_events;
 pub mod provider;
 pub mod wallet;

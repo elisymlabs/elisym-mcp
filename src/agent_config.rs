@@ -229,7 +229,7 @@ pub(crate) fn run_init(
     let sol_secret_b58 = bs58::encode(sol_keypair.to_bytes()).into_string();
     let sol_address = sol_keypair.pubkey().to_string();
 
-    let desc = description.unwrap_or("elisym MCP agent");
+    let desc = description.unwrap_or("Elisym MCP agent");
     let caps: Vec<&str> = capabilities
         .unwrap_or("mcp-gateway")
         .split(',')

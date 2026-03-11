@@ -2,7 +2,7 @@
 """YouTube transcript extractor.
 
 Usage:
-    python3 summarize.py <youtube_url> [--output transcript.json] [--lang en]
+    python3 summarize.py <youtube_url> [--output transcript.txt] [--lang en]
 
 Extracts subtitles/transcript from a YouTube video.
 Summarization is handled by the LLM (Claude) that calls this script.
@@ -37,7 +37,7 @@ def fetch_subtitles(url: str, lang: str = "en") -> str | None:
     """Try to get subtitles via yt-dlp."""
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "subs")
-        subprocess.run(
+        result = subprocess.run(
             [
                 "yt-dlp",
                 "--write-auto-sub",
@@ -50,6 +50,7 @@ def fetch_subtitles(url: str, lang: str = "en") -> str | None:
             ],
             capture_output=True, text=True, timeout=60,
         )
+        # Look for any .vtt file
         for f in os.listdir(tmpdir):
             if f.endswith(".vtt"):
                 vtt_path = os.path.join(tmpdir, f)
@@ -64,10 +65,12 @@ def parse_vtt(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
+            # Skip timestamps and headers
             if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
                 continue
             if re.match(r"^\d{2}:\d{2}", line) or "-->" in line:
                 continue
+            # Remove VTT formatting tags
             clean = re.sub(r"<[^>]+>", "", line)
             if clean and clean not in seen:
                 seen.add(clean)
@@ -76,7 +79,7 @@ def parse_vtt(path: str) -> str:
 
 
 def transcribe_audio(url: str) -> str:
-    """Download audio and transcribe with Whisper (fallback)."""
+    """Download audio and transcribe with Whisper."""
     try:
         import whisper
     except ImportError:
@@ -99,6 +102,7 @@ def transcribe_audio(url: str) -> str:
         if result.returncode != 0:
             raise RuntimeError(f"Audio download failed: {result.stderr.strip()}")
 
+        # Find the actual output file (yt-dlp may add extension)
         actual_path = audio_path
         if not os.path.exists(actual_path):
             for f in os.listdir(tmpdir):
@@ -119,14 +123,17 @@ def main():
     parser.add_argument("--lang", default="en", help="Subtitle language (default: en)")
     args = parser.parse_args()
 
+    # Validate URL
     if not re.search(r"(youtube\.com|youtu\.be)", args.url):
         print("Error: not a valid YouTube URL", file=sys.stderr)
         sys.exit(1)
 
+    # Get video info
     print("Fetching video info...", file=sys.stderr)
     video_info = get_video_info(args.url)
     print(f"Video: {video_info['title']} ({video_info['duration'] // 60} min)", file=sys.stderr)
 
+    # Get transcript
     print("Fetching subtitles...", file=sys.stderr)
     transcript = fetch_subtitles(args.url, args.lang)
 
@@ -140,6 +147,7 @@ def main():
 
     print(f"Transcript length: {len(transcript)} chars", file=sys.stderr)
 
+    # Output as JSON with metadata + transcript
     output = json.dumps({
         "title": video_info["title"],
         "channel": video_info["channel"],

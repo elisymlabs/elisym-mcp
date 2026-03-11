@@ -5,7 +5,9 @@ target/
 .vscode/
 .env.local
 temp/
+tmp/
 *.log
 CLAUDE.md
 .claude
+!examples/**/.claude
 .mcp.json

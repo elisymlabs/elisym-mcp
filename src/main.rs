@@ -143,7 +143,7 @@ fn run_init_wizard() -> Result<()> {
     // 2. Description
     let description: String = Input::with_theme(&theme)
         .with_prompt("Description")
-        .default("elisym MCP agent".into())
+        .default("Elisym MCP agent".into())
         .interact_text()
         .context("Failed to read description")?;
 
@@ -182,12 +182,17 @@ fn run_init_wizard() -> Result<()> {
         None
     };
 
-    // 6. Auto-install
-    let auto_install = Confirm::with_theme(&theme)
-        .with_prompt("Install into MCP clients (Claude Desktop, Cursor, etc.)?")
-        .default(true)
-        .interact()
-        .context("Failed to read install preference")?;
+    // 6. Auto-install (skip prompt if already configured)
+    let already_installed = install::is_installed();
+    let auto_install = if already_installed {
+        false
+    } else {
+        Confirm::with_theme(&theme)
+            .with_prompt("Install into MCP clients (Claude Desktop, Cursor, etc.)?")
+            .default(true)
+            .interact()
+            .context("Failed to read install preference")?
+    };
 
     println!();
 
@@ -203,18 +208,12 @@ fn run_init_wizard() -> Result<()> {
 
     // Auto-install if requested
     if auto_install {
-        if install::is_installed() {
-            println!();
-            println!("  MCP already configured — agent created.");
-            println!("  Use `create_agent` or `switch_agent` tools to manage agents at runtime.");
-        } else {
-            println!();
-            let mut env = vec![("ELISYM_AGENT".to_string(), name)];
-            if let Some(ref pw) = password {
-                env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.to_string()));
-            }
-            install::run_install(None, None, &env)?;
+        println!();
+        let mut env = vec![("ELISYM_AGENT".to_string(), name)];
+        if let Some(ref pw) = password {
+            env.push(("ELISYM_AGENT_PASSWORD".to_string(), pw.to_string()));
         }
+        install::run_install(None, None, &env)?;
     }
 
     if let Some(ref mut pw) = password {
@@ -398,7 +397,7 @@ async fn main() -> Result<()> {
                         eprintln!("HINT: Running non-interactively. Prefer ELISYM_AGENT_PASSWORD env var over --password.");
                     }
                 }
-                let desc = description.as_deref().or(Some("elisym MCP agent"));
+                let desc = description.as_deref().or(Some("Elisym MCP agent"));
                 let caps = capabilities.as_deref().or(Some("mcp-gateway"));
                 let net = network.as_deref().unwrap_or("devnet");
                 run_init(
