@@ -119,6 +119,17 @@ fn resolve_command() -> (String, Vec<String>) {
     ("npx".to_string(), vec!["-y".to_string(), "@elisym/elisym-mcp@latest".to_string()])
 }
 
+/// Return the CLI prefix for hint messages (e.g. "elisym-mcp" or "npx -y @elisym/elisym-mcp@latest").
+fn cli_hint() -> String {
+    if let Ok(path) = std::env::current_exe() {
+        let resolved = path.canonicalize().unwrap_or(path);
+        if resolved.exists() {
+            return "elisym-mcp".to_string();
+        }
+    }
+    "npx -y @elisym/elisym-mcp@latest".to_string()
+}
+
 fn build_server_entry(agent: Option<&str>, env: &[(String, String)]) -> Value {
     let (command, args) = resolve_command();
 
@@ -340,8 +351,9 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(Str
                 installed += 1;
             }
             Ok(false) => {
+                let hint = cli_hint();
                 println!(
-                    "  Already installed in {} ({}). To update, run: elisym-mcp uninstall && elisym-mcp install ...",
+                    "  Already installed in {} ({}). To update, run:\n    {hint} uninstall && {hint} install",
                     client.name, path.display()
                 );
                 skipped += 1;
@@ -362,8 +374,9 @@ pub fn run_install(client_filter: Option<&str>, agent: Option<&str>, env: &[(Str
                     installed += 1;
                 }
                 Ok(false) => {
+                    let hint = cli_hint();
                     println!(
-                        "  Already installed in claude-code. To update, run: elisym-mcp uninstall && elisym-mcp install ..."
+                        "  Already installed in claude-code. To update, run:\n    {hint} uninstall && {hint} install"
                     );
                     skipped += 1;
                 }
