@@ -43,6 +43,12 @@ pub struct SubmitAndPayJobInput {
     /// Total timeout in seconds for the entire flow (default: 300 = 5 min).
     #[schemars(description = "Total timeout in seconds for the full flow: submit → pay → result (default: 300)")]
     pub timeout_secs: Option<u64>,
+
+    /// Maximum price in lamports the user is willing to pay. If the provider requests more,
+    /// the job is NOT paid and the requested price is returned so the user can decide.
+    /// IMPORTANT: Always ask the user for their budget before calling this tool.
+    #[schemars(description = "Maximum price in lamports the user is willing to pay. If omitted or if provider asks more, returns price for user confirmation instead of auto-paying. Always confirm price with the user first.")]
+    pub max_price_lamports: Option<u64>,
 }
 
 /// Input for pinging an agent to check if it's online.
