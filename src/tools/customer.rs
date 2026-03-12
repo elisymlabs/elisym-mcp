@@ -51,6 +51,22 @@ pub struct SubmitAndPayJobInput {
     pub max_price_lamports: Option<u64>,
 }
 
+/// Input for listing submitted jobs and their results/feedback.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListMyJobsInput {
+    /// Maximum number of jobs to return (default: 20).
+    #[schemars(description = "Maximum number of jobs to return (default: 20, max: 50)")]
+    pub limit: Option<usize>,
+
+    /// NIP-90 job kind offset (default: 100 for kind:5100).
+    #[schemars(description = "Job kind offset to filter by (default: 100 for kind:5100)")]
+    pub kind_offset: Option<u16>,
+
+    /// Whether to fetch results and feedback for each job (default: true).
+    #[schemars(description = "Fetch results and feedback for each job (default: true). Set to false for a faster listing.")]
+    pub include_results: Option<bool>,
+}
+
 /// Input for pinging an agent to check if it's online.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PingAgentInput {

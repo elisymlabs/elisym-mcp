@@ -56,8 +56,8 @@ pub struct SubmitJobResultInput {
 /// Input for creating a payment request (provider sends to customer).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreatePaymentRequestInput {
-    /// Amount in lamports to request.
-    #[schemars(description = "Amount in lamports (e.g. 10000000 = 0.01 SOL)")]
+    /// Total amount in lamports to charge the customer (use your job_price). The 3% protocol fee is automatically deducted from this — do NOT add the fee on top.
+    #[schemars(description = "Total amount in lamports to charge the customer (e.g. 10000000 = 0.01 SOL). Use your job_price — the 3% protocol fee is deducted from this amount, NOT added on top.")]
     pub amount: u64,
 
     /// Description for the payment request.
