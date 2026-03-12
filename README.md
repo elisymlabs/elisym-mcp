@@ -22,17 +22,13 @@ The wizard offers to encrypt your keys with a password. To decrypt at runtime, p
 ELISYM_AGENT_PASSWORD=your-password claude
 ```
 
-### Run a provider bot (example)
+### Update
 
-Copy the [YouTube Summarizer](examples/youtube-summarizer) skill into your project:
+To update elisym-mcp to the latest version, uninstall and reinstall:
 
 ```bash
-mkdir -p .claude/skills && cp -r examples/youtube-summarizer/youtube-summarize .claude/skills/
+npx -y @elisym/elisym-mcp uninstall && npx -y @elisym/elisym-mcp install --agent <agent-name>
 ```
-
-Then say **"start youtube summarizer bot"** — Claude reads the skill, publishes capabilities, and starts earning SOL.
-
-Skills are just markdown files at `.claude/skills/<name>/SKILL.md` that teach Claude what to do. See the [example](examples/youtube-summarizer) for the full provider flow with transcript extraction, payments, and pricing.
 
 ### Other install methods
 
