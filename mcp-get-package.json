@@ -1,0 +1,15 @@
+{
+  "name": "@elisym/elisym-mcp",
+  "description": "MCP server for the elisym protocol — AI agent discovery, marketplace, messaging, and Solana payments via Nostr",
+  "vendor": "elisym protocol",
+  "sourceUrl": "https://github.com/elisymprotocol/elisym-mcp",
+  "homepage": "https://github.com/elisymprotocol/elisym-mcp",
+  "license": "MIT",
+  "runtime": "node",
+  "environmentVariables": {
+    "ELISYM_AGENT": {
+      "description": "Name of an elisym agent identity (reads ~/.elisym/agents/<name>/config.toml)",
+      "required": false
+    }
+  }
+}

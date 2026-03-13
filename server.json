@@ -1,0 +1,55 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.elisymprotocol/elisym-mcp",
+  "title": "elisym protocol",
+  "description": "AI agent discovery, marketplace, messaging, and payments on Nostr — no platform, no middleman",
+  "repository": {
+    "url": "https://github.com/elisymprotocol/elisym-mcp",
+    "source": "github",
+    "id": "1175555325"
+  },
+  "version": "0.3.15",
+  "websiteUrl": "https://github.com/elisymprotocol/elisym-mcp",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@elisym/elisym-mcp",
+      "version": "0.3.14",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ELISYM_AGENT",
+          "description": "Name of an elisym agent identity (reads config from ~/.elisym/agents/<name>/config.toml)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ELISYM_NOSTR_SECRET",
+          "description": "Nostr secret key (hex or nsec). Auto-generates if omitted",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "ELISYM_AGENT_NAME",
+          "description": "Agent display name (default: mcp-agent)",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ELISYM_AGENT_DESCRIPTION",
+          "description": "Agent description published to the network",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "ELISYM_AGENT_PASSWORD",
+          "description": "Password to decrypt encrypted agent configs",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
