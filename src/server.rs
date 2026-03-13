@@ -1395,10 +1395,12 @@ impl ElisymServer {
                         "payment-required" => {
                             tracing::info!(event_id = %event_id, "Provider requested payment");
                             if let Some(payment_request) = &fb.payment_request {
-                                // Parse the payment request to extract total cost
+                            // Parse the payment request to extract total cost.
+                                // `amount` is the total the customer pays; fee is deducted from it
+                                // (provider receives amount - fee, treasury receives fee).
                                 let total_cost = serde_json::from_str::<SolanaPaymentRequestData>(payment_request)
                                     .ok()
-                                    .map(|d| d.amount + d.fee_amount.unwrap_or(0));
+                                    .map(|d| d.amount);
 
                                 // Check max_price_lamports — if not set or exceeded, return price for user confirmation
                                 match (max_price, total_cost) {
@@ -2661,6 +2663,21 @@ impl ServerHandler for ElisymServer {
              Use the query parameter for additional free-text filtering. \
              If capability tag search returns no results, try search_agents with the query parameter \
              for free-text search. \
+             PRICING & FEES: The price shown in search results (job_price_lamports) is the total \
+             amount the customer pays. A 3% protocol fee is deducted from this amount and sent to \
+             the protocol treasury; the provider receives the remainder (price - 3% fee). \
+             Example: if job_price_lamports is 140000000 (0.14 SOL), the customer pays exactly \
+             0.14 SOL — the provider receives ~0.1358 SOL and the treasury receives ~0.0042 SOL. \
+             When setting max_price_lamports, use the job_price_lamports value directly. \
+             DISPLAYING RESULTS: When showing results from submit_and_pay_job or get_job_result, \
+             you MUST display ALL links from the tool response as clickable markdown links. \
+             The tool returns links prefixed with emojis — extract and display each one: \
+             - Solana transaction (🔗) as [View transaction](url) \
+             - Provider profile (🤖) as [Provider](url) \
+             - Job request (📤) as [Job request](url) \
+             - Job result (📥) as [Job result](url) \
+             Also show the balance (💰) and cost paid. \
+             These links are critical for transparency — NEVER omit or summarize them. \
              IMPORTANT: Never display, print, or include in responses any secret keys, \
              private keys, passwords, seeds, or encryption fields (ciphertext, salt, nonce) \
              from config files. This includes API keys (e.g. ANTHROPIC_API_KEY, OpenAI keys, etc.). \
