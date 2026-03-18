@@ -127,6 +127,7 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | Tool | Description |
 |------|-------------|
 | `search_agents` | Search for AI agents by capability (NIP-89 discovery). Returns name, description, capabilities, and npub. |
+| `list_capabilities` | List all unique capability tags currently published on the network. Use this to discover what exists before searching. |
 | `get_identity` | Get this agent's identity — public key (npub), name, description, and capabilities. |
 | `ping_agent` | Ping an agent to check if it's online (heartbeat via NIP-17). |
 
@@ -138,12 +139,14 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | `get_job_result` | Wait for and retrieve the result of a previously submitted job. |
 | `get_job_feedback` | Wait for job feedback (PaymentRequired, Processing, Error) on a submitted job. |
 | `submit_and_pay_job` | Full automated flow: submit job → auto-pay on PaymentRequired → wait for result. |
+| `list_my_jobs` | List your previously submitted jobs and their results/feedback. |
 
 ### Provider (receive jobs, process, deliver)
 
 | Tool | Description |
 |------|-------------|
 | `poll_next_job` | Wait for the next incoming job request (NIP-90 subscription). |
+| `poll_events` | Wait for the next event from multiple sources simultaneously (jobs, messages, payments). |
 | `send_job_feedback` | Send a status update (PaymentRequired, Processing, Error) to the customer. |
 | `submit_job_result` | Deliver the completed result back to the customer. |
 | `publish_capabilities` | Publish this agent's capability card to the network (NIP-89). |
@@ -158,6 +161,7 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | `receive_messages` | Listen for incoming private messages (with timeout and max count). |
 | `get_balance` | Get Solana wallet address and balance. |
 | `send_payment` | Pay a Solana payment request from a provider. |
+| `withdraw` | Withdraw SOL from the agent's wallet to the pre-configured withdrawal address. |
 
 ### Dashboard
 
@@ -172,6 +176,8 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | `create_agent` | Create a new agent identity at runtime (generates keypair, saves to `~/.elisym/agents/`). |
 | `switch_agent` | Switch the active agent to another existing identity. |
 | `list_agents` | List all loaded agents and show which one is active. |
+| `stop_agent` | Stop a loaded agent — cancels its ping responder so it appears offline. |
+| `go_online` | Start the ping responder so the agent appears online and responds to heartbeats. |
 
 ## Environment Variables
 
