@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use elisym_core::{
     AgentFilter, AgentNode, PaymentProvider,
     DEFAULT_KIND_OFFSET, KIND_JOB_FEEDBACK, KIND_JOB_RESULT_BASE, kind,
+    validate_protocol_fee,
 };
+#[cfg(test)]
+use elisym_core::calculate_protocol_fee;
 use nostr_sdk::prelude::*;
 use rmcp::{
     ServerHandler,
@@ -31,12 +34,7 @@ use crate::tools::provider::{
     PublishCapabilitiesInput, SendJobFeedbackInput, SubmitJobResultInput,
 };
 use crate::sanitize::{sanitize_untrusted, sanitize_field, is_likely_base64, ContentKind};
-use crate::tools::wallet::SendPaymentInput;
-
-/// Protocol fee in basis points (300 = 3%).
-const PROTOCOL_FEE_BPS: u64 = 300;
-/// Solana address of the protocol treasury.
-const PROTOCOL_TREASURY: &str = "GY7vnWMkKpftU4nQ16C2ATkj1JwrQpHhknkaBUn67VTy";
+use crate::tools::wallet::{SendPaymentInput, WithdrawInput};
 
 // ── Input length limits ──────────────────────────────────────────────
 const MAX_INPUT_LEN: usize = 100_000;
@@ -121,73 +119,6 @@ impl JobEventsCache {
     }
 }
 
-/// Parsed Solana payment request for fee validation.
-#[derive(Debug, Deserialize)]
-struct SolanaPaymentRequestData {
-    recipient: String,
-    amount: u64,
-    #[allow(dead_code)]
-    reference: String,
-    fee_address: Option<String>,
-    fee_amount: Option<u64>,
-}
-
-/// Validate that a payment request has the correct recipient and protocol fee params.
-/// `expected_recipient` is the provider's Solana address from their capability card.
-/// Returns an error message if invalid, None if OK.
-fn validate_payment_fee(request: &str, expected_recipient: Option<&str>) -> Option<String> {
-    let data: SolanaPaymentRequestData = match serde_json::from_str(request) {
-        Ok(d) => d,
-        Err(e) => return Some(format!("Invalid payment request JSON: {e}")),
-    };
-
-    // Validate recipient matches the provider's known Solana address
-    if let Some(expected) = expected_recipient {
-        if data.recipient != expected {
-            return Some(format!(
-                "Recipient mismatch: expected {expected}, got {}. \
-                 Provider may be attempting to redirect payment.",
-                data.recipient
-            ));
-        }
-    }
-
-    let expected_fee = data
-        .amount
-        .checked_mul(PROTOCOL_FEE_BPS)
-        .map(|v| v.div_ceil(10_000))
-        .unwrap_or(u64::MAX);
-
-    match (data.fee_address.as_deref(), data.fee_amount) {
-        (Some(addr), Some(amt)) if amt > 0 => {
-            if addr != PROTOCOL_TREASURY {
-                return Some(format!(
-                    "Fee address mismatch: expected {PROTOCOL_TREASURY}, got {addr}. \
-                     Provider may be attempting to redirect fees."
-                ));
-            }
-            if amt != expected_fee {
-                return Some(format!(
-                    "Fee amount mismatch: expected {expected_fee} lamports ({}bps of {}), got {amt}. \
-                     Provider may be tampering with fee.",
-                    PROTOCOL_FEE_BPS, data.amount
-                ));
-            }
-            None
-        }
-        (None, None) => {
-            Some(format!(
-                "Payment request missing protocol fee ({PROTOCOL_FEE_BPS}bps). \
-                 Expected fee: {expected_fee} lamports to {PROTOCOL_TREASURY}."
-            ))
-        }
-        _ => Some(format!(
-            "Invalid fee params in payment request. \
-             Expected fee: {expected_fee} lamports to {PROTOCOL_TREASURY}."
-        )),
-    }
-}
-
 /// Truncate a string to `max` chars, appending "…" if truncated. UTF-8 safe.
 fn truncate_str(s: &str, max: usize) -> Cow<'_, str> {
     match s.char_indices().nth(max) {
@@ -215,6 +146,73 @@ fn format_sol_short(lamports: u64) -> String {
         lamports / 1_000_000_000,
         (lamports % 1_000_000_000) / 100_000
     )
+}
+
+/// Parse a SOL amount string (e.g. "0.5", "1.0") to lamports. Integer math only.
+fn parse_sol_to_lamports(s: &str) -> Result<u64, String> {
+    const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("amount is empty".into());
+    }
+    if s.starts_with('-') {
+        return Err("amount cannot be negative".into());
+    }
+    if let Some(dot_pos) = s.find('.') {
+        let whole: u64 = if dot_pos == 0 {
+            0
+        } else {
+            s[..dot_pos].parse().map_err(|e| format!("invalid whole part: {e}"))?
+        };
+        let frac_str = &s[dot_pos + 1..];
+        if frac_str.len() > 9 {
+            return Err("too many decimal places (max 9)".into());
+        }
+        let frac: u64 = if frac_str.is_empty() {
+            0
+        } else {
+            let padded = format!("{:0<9}", frac_str);
+            padded.parse().map_err(|e| format!("invalid fractional part: {e}"))?
+        };
+        whole.checked_mul(LAMPORTS_PER_SOL)
+            .and_then(|w| w.checked_add(frac))
+            .ok_or_else(|| "amount overflow".to_string())
+    } else {
+        let whole: u64 = s.parse().map_err(|e| format!("invalid amount: {e}"))?;
+        whole.checked_mul(LAMPORTS_PER_SOL)
+            .ok_or_else(|| "amount overflow".to_string())
+    }
+}
+
+/// Standard Solana transaction fee reserve in lamports.
+const TX_FEE_RESERVE: u64 = 5_000;
+
+/// Validate and resolve a withdrawal amount.
+///
+/// - `"all"` → entire balance minus tx fee reserve
+/// - Otherwise parse as SOL amount via `parse_sol_to_lamports`
+///
+/// Returns the lamports to withdraw, or an error message.
+fn validate_withdraw_amount(amount_sol: &str, balance: u64) -> Result<u64, String> {
+    let lamports = if amount_sol.trim().eq_ignore_ascii_case("all") {
+        balance.saturating_sub(TX_FEE_RESERVE)
+    } else {
+        parse_sol_to_lamports(amount_sol)?
+    };
+
+    if lamports == 0 {
+        return Err("Nothing to withdraw (balance too low or zero amount).".into());
+    }
+
+    if lamports.checked_add(TX_FEE_RESERVE).is_none_or(|total| total > balance) {
+        return Err(format!(
+            "Insufficient balance. Have: {}, need: {} + fee",
+            format_sol(balance),
+            format_sol(lamports),
+        ));
+    }
+
+    Ok(lamports)
 }
 
 /// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
@@ -291,6 +289,10 @@ impl RateLimiter {
 /// Shared across all HTTP sessions; for stdio transport this is a single-client process.
 static TOOL_RATE_LIMITER: RateLimiter = RateLimiter::new(10, 10);
 
+/// Stricter rate limiter for financial withdrawal operations.
+/// Limits to 3 calls per 60-second window.
+static WITHDRAW_RATE_LIMITER: RateLimiter = RateLimiter::new(3, 60);
+
 /// An agent entry in the registry, bundling the node with its ping responder handle.
 pub struct AgentEntry {
     pub node: Arc<AgentNode>,
@@ -307,6 +309,9 @@ pub struct ElisymServer {
     active_agent_name: Arc<std::sync::RwLock<String>>,
     /// Stores raw events for received job requests (provider flow).
     job_cache: Arc<Mutex<JobEventsCache>>,
+    /// Pre-configured withdrawal address (from agent config). When set, the
+    /// `withdraw` tool sends funds only to this address.
+    withdrawal_address: Option<String>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -354,8 +359,15 @@ impl ElisymServer {
             agent_registry: Arc::new(std::sync::RwLock::new(HashMap::new())),
             active_agent_name: Arc::new(std::sync::RwLock::new(String::new())),
             job_cache: Arc::new(Mutex::new(JobEventsCache::new())),
+            withdrawal_address: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Set the pre-configured withdrawal address (from agent config).
+    pub fn with_withdrawal_address(mut self, addr: Option<String>) -> Self {
+        self.withdrawal_address = addr;
+        self
     }
 
     /// Create from shared state (used by HTTP transport factory).
@@ -364,12 +376,14 @@ impl ElisymServer {
         agent_registry: Arc<std::sync::RwLock<HashMap<String, AgentEntry>>>,
         active_agent_name: Arc<std::sync::RwLock<String>>,
         job_cache: Arc<Mutex<JobEventsCache>>,
+        withdrawal_address: Option<String>,
     ) -> Self {
         Self {
             pending_builder: Arc::new(tokio::sync::Mutex::new(None)),
             agent_registry,
             active_agent_name,
             job_cache,
+            withdrawal_address,
             tool_router: Self::tool_router(),
         }
     }
@@ -1398,29 +1412,28 @@ impl ElisymServer {
                             // Parse the payment request to extract total cost.
                                 // `amount` is the total the customer pays; fee is deducted from it
                                 // (provider receives amount - fee, treasury receives fee).
-                                let total_cost = serde_json::from_str::<SolanaPaymentRequestData>(payment_request)
+                                let total_cost = serde_json::from_str::<serde_json::Value>(payment_request)
                                     .ok()
-                                    .map(|d| d.amount);
+                                    .and_then(|v| v.get("amount")?.as_u64());
 
                                 // Check max_price_lamports — if not set or exceeded, return price for user confirmation
                                 match (max_price, total_cost) {
                                     (None, Some(cost)) => {
-                                        let sol = cost as f64 / 1_000_000_000.0;
                                         status_log.push(format!(
-                                            "Provider requests payment of {cost} lamports ({sol:.6} SOL). \
-                                             Call again with max_price_lamports >= {cost} to approve and pay."
+                                            "Provider requests payment of {} ({cost} lamports). \
+                                             Call again with max_price_lamports >= {cost} to approve and pay.",
+                                            format_sol(cost)
                                         ));
                                         return Ok(CallToolResult::success(vec![Content::text(
                                             status_log.join("\n")
                                         )]));
                                     }
                                     (Some(limit), Some(cost)) if cost > limit => {
-                                        let sol = cost as f64 / 1_000_000_000.0;
-                                        let limit_sol = limit as f64 / 1_000_000_000.0;
                                         status_log.push(format!(
-                                            "Provider requests {cost} lamports ({sol:.6} SOL) which exceeds \
-                                             your limit of {limit} lamports ({limit_sol:.6} SOL). \
-                                             Increase max_price_lamports to approve, or decline."
+                                            "Provider requests {} ({cost} lamports) which exceeds \
+                                             your limit of {} ({limit} lamports). \
+                                             Increase max_price_lamports to approve, or decline.",
+                                            format_sol(cost), format_sol(limit)
                                         ));
                                         return Ok(CallToolResult::success(vec![Content::text(
                                             status_log.join("\n")
@@ -1430,7 +1443,7 @@ impl ElisymServer {
                                 }
 
                                 // Validate recipient and fee before paying
-                                if let Some(err) = validate_payment_fee(payment_request, Some(&provider_solana_address)) {
+                                if let Err(err) = validate_protocol_fee(payment_request, &provider_solana_address) {
                                     status_log.push(format!("Fee validation failed: {err}"));
                                     return Ok(CallToolResult::error(vec![Content::text(
                                         status_log.join("\n")
@@ -1444,8 +1457,9 @@ impl ElisymServer {
                                 }
                                 let pay_agent = Arc::clone(&agent);
                                 let pr = payment_request.clone();
+                                let expected_addr = provider_solana_address.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    pay_agent.solana_payments().unwrap().pay(&pr)
+                                    pay_agent.solana_payments().unwrap().pay_validated(&pr, &expected_addr)
                                 }).await {
                                     Ok(Ok(result)) => {
                                         status_log.push(format!(
@@ -1816,15 +1830,10 @@ impl ElisymServer {
             )]));
         }
 
-        // Validate recipient and fee params before paying — prevent provider from tampering
-        if let Some(err) = validate_payment_fee(&input.payment_request, input.expected_recipient.as_deref()) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Fee validation failed: {err}"
-            ))]));
-        }
         let payment_request = input.payment_request;
+        let expected_addr = input.expected_recipient;
         match tokio::task::spawn_blocking(move || {
-            agent.solana_payments().unwrap().pay(&payment_request)
+            agent.solana_payments().unwrap().pay_validated(&payment_request, &expected_addr)
         }).await {
             Ok(Ok(result)) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Payment sent successfully.\nTransaction: {}\nStatus: {}",
@@ -1836,6 +1845,105 @@ impl ElisymServer {
             ))])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Payment task panicked: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(description = "Withdraw SOL from the agent's wallet to the pre-configured withdrawal address. The withdrawal address is set in the agent's config.toml (payment.withdrawal_address) and CANNOT be changed at runtime — this prevents prompt injection from redirecting funds. Use amount_sol=\"all\" to withdraw the full balance.")]
+    async fn withdraw(
+        &self,
+        Parameters(input): Parameters<WithdrawInput>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if let Err(err) = WITHDRAW_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = TOOL_RATE_LIMITER.check() {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+        if let Err(err) = check_len("amount_sol", &input.amount_sol, 32) {
+            return Ok(CallToolResult::error(vec![Content::text(err)]));
+        }
+
+        let withdrawal_address = match &self.withdrawal_address {
+            Some(addr) => addr.clone(),
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "No withdrawal address configured. Set payment.withdrawal_address in the agent's config.toml.",
+                )]));
+            }
+        };
+
+        let agent = self.ensure_agent().await?;
+        if agent.solana_payments().is_none() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
+            )]));
+        }
+
+        let balance = match tokio::task::spawn_blocking({
+            let agent = Arc::clone(&agent);
+            move || agent.solana_payments().unwrap().balance()
+        }).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to get balance: {e}"
+                ))]));
+            }
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Balance check panicked: {e}"
+                ))]));
+            }
+        };
+
+        let lamports = match validate_withdraw_amount(&input.amount_sol, balance) {
+            Ok(l) => l,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+
+        // Require explicit confirmation before executing the transfer
+        if input.confirm != Some(true) {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Withdrawal preview:\n\
+                 Amount: {}\n\
+                 To: {withdrawal_address}\n\
+                 Current balance: {}\n\n\
+                 To execute, call withdraw again with confirm: true.",
+                format_sol(lamports),
+                format_sol(balance),
+            ))]));
+        }
+
+        // Send transfer via elisym-core (handles keypair, RPC, signing internally)
+        let addr = withdrawal_address.clone();
+        let agent2 = Arc::clone(&agent);
+        match tokio::task::spawn_blocking(move || {
+            agent.solana_payments().unwrap().transfer(&addr, lamports)
+        }).await {
+            Ok(Ok(sig)) => {
+                // Fetch updated balance
+                let new_balance = match tokio::task::spawn_blocking({
+                    move || agent2.solana_payments().unwrap().balance()
+                }).await {
+                    Ok(Ok(b)) => format_sol(b),
+                    _ => "unknown".to_string(),
+                };
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Withdrawal successful.\n\
+                     Amount: {}\n\
+                     To: {withdrawal_address}\n\
+                     Signature: {sig}\n\
+                     Remaining balance: {new_balance}",
+                    format_sol(lamports),
+                ))]))
+            }
+            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Withdrawal failed: {e}"
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Withdrawal task panicked: {e}"
             ))])),
         }
     }
@@ -2241,25 +2349,17 @@ impl ElisymServer {
         }
 
         let expiry = input.expiry_secs.unwrap_or(600);
-        // Fee rounds up to nearest lamport (div_ceil favors protocol).
-        // checked_mul guards against overflow on very large amounts.
-        let fee_amount = input
-            .amount
-            .checked_mul(PROTOCOL_FEE_BPS)
-            .map(|v| v.div_ceil(10_000))
-            .unwrap_or(u64::MAX);
         let amount = input.amount;
         let description = input.description;
         match tokio::task::spawn_blocking(move || {
-            agent.solana_payments().unwrap().create_payment_request_with_fee(
+            agent.solana_payments().unwrap().create_payment_request_with_protocol_fee(
                 amount,
                 &description,
                 expiry,
-                PROTOCOL_TREASURY,
-                fee_amount,
             )
         }).await {
             Ok(Ok(req)) => {
+                let fee_amount = elisym_core::calculate_protocol_fee(amount).unwrap_or(0);
                 let provider_net = amount.saturating_sub(fee_amount);
                 let result = serde_json::json!({
                     "payment_request": req.request,
@@ -2785,6 +2885,7 @@ impl ServerHandler for ElisymServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use elisym_core::PROTOCOL_TREASURY;
 
     // ── JobEventsCache ──────────────────────────────────────────────
 
@@ -2903,55 +3004,55 @@ mod tests {
     #[test]
     fn valid_fee() {
         let amount = 10_000_000u64;
-        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(amount).unwrap();
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
-        assert!(validate_payment_fee(&json, None).is_none());
+        assert!(validate_protocol_fee(&json, "SomeAddress").is_ok());
     }
 
     #[test]
     fn wrong_treasury_address() {
         let amount = 10_000_000u64;
-        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(amount).unwrap();
         let json = make_payment_json(amount, Some("WrongAddress"), Some(fee));
-        let err = validate_payment_fee(&json, None).unwrap();
-        assert!(err.contains("Fee address mismatch"));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("Fee address mismatch"));
     }
 
     #[test]
     fn wrong_fee_amount() {
         let amount = 10_000_000u64;
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(1));
-        let err = validate_payment_fee(&json, None).unwrap();
-        assert!(err.contains("Fee amount mismatch"));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("Fee amount mismatch"));
     }
 
     #[test]
     fn missing_fee() {
         let json = make_payment_json(10_000_000, None, None);
-        let err = validate_payment_fee(&json, None).unwrap();
-        assert!(err.contains("missing protocol fee"));
+        let err = validate_protocol_fee(&json, "SomeAddress").unwrap_err();
+        assert!(err.to_string().contains("missing protocol fee"));
     }
 
     #[test]
     fn invalid_json() {
-        assert!(validate_payment_fee("not json", None).is_some());
+        assert!(validate_protocol_fee("not json", "SomeAddress").is_err());
     }
 
     #[test]
     fn valid_recipient() {
         let amount = 10_000_000u64;
-        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(amount).unwrap();
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
-        assert!(validate_payment_fee(&json, Some("SomeAddress")).is_none());
+        assert!(validate_protocol_fee(&json, "SomeAddress").is_ok());
     }
 
     #[test]
     fn wrong_recipient() {
         let amount = 10_000_000u64;
-        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(amount).unwrap();
         let json = make_payment_json(amount, Some(PROTOCOL_TREASURY), Some(fee));
-        let err = validate_payment_fee(&json, Some("DifferentAddress")).unwrap();
-        assert!(err.contains("Recipient mismatch"));
+        let err = validate_protocol_fee(&json, "DifferentAddress").unwrap_err();
+        assert!(err.to_string().contains("Recipient mismatch"));
     }
 
     // ── format_sol ──────────────────────────────────────────────────
@@ -2991,31 +3092,28 @@ mod tests {
     #[test]
     fn fee_calculation_standard() {
         let amount = 10_000_000u64;
-        let fee = (amount * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(amount).unwrap();
         assert_eq!(fee, 300_000); // 3% of 10M
     }
 
     #[test]
     fn fee_calculation_rounds_up() {
         // 1 lamport: (1 * 300) / 10_000 = 0.03 → rounds up to 1
-        let fee = (1u64 * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(1).unwrap();
         assert_eq!(fee, 1);
     }
 
     #[test]
     fn fee_calculation_zero() {
-        let fee = (0u64 * PROTOCOL_FEE_BPS).div_ceil(10_000);
+        let fee = calculate_protocol_fee(0).unwrap();
         assert_eq!(fee, 0);
     }
 
     #[test]
     fn fee_calculation_overflow_safe() {
-        // Very large amount that would overflow with unchecked mul
+        // Very large amount that would overflow with checked_mul
         let large = u64::MAX / 100;
-        let fee = large
-            .checked_mul(PROTOCOL_FEE_BPS)
-            .map(|v| v.div_ceil(10_000))
-            .unwrap_or(u64::MAX);
+        let fee = calculate_protocol_fee(large).unwrap_or(u64::MAX);
         assert_eq!(fee, u64::MAX);
     }
 
@@ -3044,5 +3142,121 @@ mod tests {
             assert!(limiter.check().is_ok());
         }
         assert!(limiter.check().is_err());
+    }
+
+    // ── WITHDRAW_RATE_LIMITER ─────────────────────────────────────
+
+    #[test]
+    fn withdraw_rate_limiter_allows_within_limit() {
+        let limiter = RateLimiter::new(3, 60);
+        for _ in 0..3 {
+            assert!(limiter.check().is_ok());
+        }
+    }
+
+    #[test]
+    fn withdraw_rate_limiter_rejects_over_limit() {
+        let limiter = RateLimiter::new(3, 60);
+        for _ in 0..3 {
+            limiter.check().unwrap();
+        }
+        assert!(limiter.check().is_err());
+    }
+
+    #[test]
+    fn withdraw_rate_limiter_error_message() {
+        let limiter = RateLimiter::new(3, 60);
+        for _ in 0..3 {
+            limiter.check().unwrap();
+        }
+        let err = limiter.check().unwrap_err();
+        assert!(err.contains("3"), "should mention max calls: {err}");
+        assert!(err.contains("60"), "should mention window seconds: {err}");
+    }
+
+    // ── validate_withdraw_amount ──────────────────────────────────
+
+    #[test]
+    fn validate_withdraw_all() {
+        // 1 SOL balance → should withdraw all minus fee reserve
+        let balance = 1_000_000_000;
+        let result = validate_withdraw_amount("all", balance).unwrap();
+        assert_eq!(result, balance - TX_FEE_RESERVE);
+    }
+
+    #[test]
+    fn validate_withdraw_all_zero_balance() {
+        let result = validate_withdraw_amount("all", 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_withdraw_all_tiny_balance() {
+        // Balance exactly equals fee reserve → saturating_sub gives 0 → error
+        let result = validate_withdraw_amount("all", TX_FEE_RESERVE);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_withdraw_specific_amount() {
+        let balance = 1_000_000_000; // 1 SOL
+        let result = validate_withdraw_amount("0.5", balance).unwrap();
+        assert_eq!(result, 500_000_000);
+    }
+
+    #[test]
+    fn validate_withdraw_insufficient() {
+        let balance = 100_000_000; // 0.1 SOL
+        let result = validate_withdraw_amount("0.5", balance);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Insufficient"));
+    }
+
+    #[test]
+    fn validate_withdraw_invalid_input() {
+        let result = validate_withdraw_amount("abc", 1_000_000_000);
+        assert!(result.is_err());
+    }
+
+    // ── parse_sol_to_lamports ──────────────────────────────────────
+
+    #[test]
+    fn parse_sol_basic() {
+        assert_eq!(parse_sol_to_lamports("1").unwrap(), 1_000_000_000);
+        assert_eq!(parse_sol_to_lamports("0.5").unwrap(), 500_000_000);
+        assert_eq!(parse_sol_to_lamports("1.0").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn parse_sol_empty() {
+        assert!(parse_sol_to_lamports("").is_err());
+        assert!(parse_sol_to_lamports("  ").is_err());
+    }
+
+    #[test]
+    fn parse_sol_negative() {
+        assert!(parse_sol_to_lamports("-1").is_err());
+        assert!(parse_sol_to_lamports("-0.5").is_err());
+    }
+
+    #[test]
+    fn parse_sol_leading_dot() {
+        assert_eq!(parse_sol_to_lamports(".5").unwrap(), 500_000_000);
+        assert_eq!(parse_sol_to_lamports(".000000001").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_sol_trailing_dot() {
+        assert_eq!(parse_sol_to_lamports("1.").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn parse_sol_too_many_decimals() {
+        assert!(parse_sol_to_lamports("0.0000000001").is_err());
+    }
+
+    #[test]
+    fn parse_sol_overflow() {
+        assert!(parse_sol_to_lamports("18446744074").is_err());
     }
 }

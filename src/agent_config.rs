@@ -64,6 +64,11 @@ pub(crate) struct PaymentSection {
     #[serde(default = "default_payment_timeout")]
     #[allow(dead_code)]
     pub(crate) payment_timeout_secs: u32,
+    /// Pre-configured address for withdrawals. When set, the `withdraw` MCP
+    /// tool sends funds only to this address — LLM cannot choose a different
+    /// destination, preventing prompt-injection fund theft.
+    #[serde(default)]
+    pub(crate) withdrawal_address: Option<String>,
 }
 
 impl std::fmt::Debug for PaymentSection {
@@ -98,6 +103,19 @@ pub(crate) fn validate_agent_name(name: &str) -> Result<()> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "Invalid agent name: '{name}'. Only [a-zA-Z0-9_-] allowed, max 64 chars."
+    );
+    Ok(())
+}
+
+/// Validate that a string is a valid base58-encoded 32-byte Solana public key.
+pub(crate) fn validate_solana_address(addr: &str) -> Result<()> {
+    let bytes = bs58::decode(addr)
+        .into_vec()
+        .with_context(|| format!("Invalid Solana address '{addr}': not valid base58"))?;
+    anyhow::ensure!(
+        bytes.len() == 32,
+        "Invalid Solana address '{addr}': expected 32 bytes, got {}",
+        bytes.len()
     );
     Ok(())
 }
@@ -203,6 +221,27 @@ pub(crate) fn build_solana_provider(payment: &PaymentSection) -> Option<SolanaPa
             None
         }
     }
+}
+
+/// Extract and validate the withdrawal address from an agent config.
+///
+/// Returns `Ok(Some(address))` if a valid withdrawal address is configured,
+/// `Ok(None)` if payment is missing or no address is set (with a warning),
+/// or `Err` if the address is invalid.
+pub(crate) fn extract_withdrawal_address(config: &AgentConfig) -> Result<Option<String>> {
+    let wa = config
+        .payment
+        .as_ref()
+        .and_then(|p| p.withdrawal_address.clone());
+    if let Some(ref addr) = wa {
+        validate_solana_address(addr)?;
+    } else if config.payment.is_some() {
+        tracing::warn!(
+            "No withdrawal_address configured in [payment] section. \
+             The withdraw tool will be unavailable."
+        );
+    }
+    Ok(wa)
 }
 
 pub(crate) fn run_init(
@@ -368,4 +407,42 @@ pub(crate) fn run_init(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_solana_address() {
+        // 32-byte key encoded in base58
+        let addr = bs58::encode([1u8; 32]).into_string();
+        assert!(validate_solana_address(&addr).is_ok());
+    }
+
+    #[test]
+    fn invalid_base58() {
+        // '0', 'O', 'I', 'l' are not valid base58 characters
+        assert!(validate_solana_address("0OIl!!!").is_err());
+    }
+
+    #[test]
+    fn wrong_length_short() {
+        let addr = bs58::encode([1u8; 16]).into_string();
+        let err = validate_solana_address(&addr).unwrap_err();
+        assert!(err.to_string().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn wrong_length_long() {
+        let addr = bs58::encode([1u8; 64]).into_string();
+        let err = validate_solana_address(&addr).unwrap_err();
+        assert!(err.to_string().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn empty_address() {
+        // Empty string decodes to 0 bytes — should fail length check
+        assert!(validate_solana_address("").is_err());
+    }
 }

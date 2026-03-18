@@ -15,7 +15,8 @@ use tracing_subscriber::{self, EnvFilter};
 use zeroize::{Zeroize, Zeroizing};
 
 use agent_config::{
-    builder_from_config, load_agent_config, run_init, validate_agent_name,
+    builder_from_config, extract_withdrawal_address, load_agent_config, run_init,
+    validate_agent_name,
 };
 use server::ElisymServer;
 
@@ -230,6 +231,7 @@ async fn start_http_server(
     host: &str,
     port: u16,
     http_token: Option<String>,
+    withdrawal_address: Option<String>,
 ) -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -268,13 +270,13 @@ async fn start_http_server(
     let registry_clone = Arc::clone(&agent_registry);
     let active_clone = Arc::clone(&active_agent_name);
     let job_cache_clone = Arc::clone(&job_cache);
-
     let service: StreamableHttpService<ElisymServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(ElisymServer::from_shared(
                 Arc::clone(&registry_clone),
                 Arc::clone(&active_clone),
                 Arc::clone(&job_cache_clone),
+                withdrawal_address.clone(),
             )),
             Default::default(),
             config,
@@ -452,10 +454,11 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting elisym MCP server");
 
-    let (agent_name, builder) = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
+    let (agent_name, builder, withdrawal_address) = if let Ok(agent_name) = std::env::var("ELISYM_AGENT") {
         let config = load_agent_config(&agent_name)?;
         tracing::info!(agent = %agent_name, "Loading agent from ~/.elisym/agents/");
-        (agent_name, builder_from_config(&config))
+        let wa = extract_withdrawal_address(&config)?;
+        (agent_name, builder_from_config(&config), wa)
     } else if std::env::var("ELISYM_NOSTR_SECRET").is_ok() {
         // Explicit secret key — ephemeral mode, no auto-persist
         let agent_name =
@@ -475,7 +478,8 @@ async fn main() -> Result<()> {
                 b = b.relays(relay_list);
             }
         }
-        (agent_name, b)
+        tracing::info!("Ephemeral agent mode — withdraw tool unavailable (no config file).");
+        (agent_name, b, None)
     } else {
         // No ELISYM_AGENT, no ELISYM_NOSTR_SECRET — check default_agent, then fallback
         let agent_name = std::env::var("ELISYM_AGENT_NAME")
@@ -496,7 +500,8 @@ async fn main() -> Result<()> {
                     .context("Failed to load newly created agent config")?
             }
         };
-        (agent_name, builder_from_config(&config))
+        let wa = extract_withdrawal_address(&config)?;
+        (agent_name, builder_from_config(&config), wa)
     };
 
     if cli.http {
@@ -508,7 +513,7 @@ async fn main() -> Result<()> {
             let http_token = cli
                 .http_token
                 .or_else(|| std::env::var("ELISYM_HTTP_TOKEN").ok());
-            start_http_server(builder, &cli.host, cli.port, http_token).await?;
+            start_http_server(builder, &cli.host, cli.port, http_token, withdrawal_address).await?;
         }
         #[cfg(not(feature = "transport-http"))]
         {
@@ -517,7 +522,8 @@ async fn main() -> Result<()> {
             );
         }
     } else {
-        let server = ElisymServer::new(agent_name, builder);
+        let server = ElisymServer::new(agent_name, builder)
+            .with_withdrawal_address(withdrawal_address);
         let service = server
             .serve(stdio())
             .await
