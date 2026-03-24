@@ -285,7 +285,7 @@ jobs:
             "license": "MIT",
             "repository": {
               "type": "git",
-              "url": "https://github.com/elisymprotocol/elisym-mcp"
+              "url": "https://github.com/elisymlabs/elisym-mcp"
             },
             "os": ["${os_map[$i]}"],
             "cpu": ["${cpu_map[$i]}"],

@@ -16,6 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /build/target/release/elisym-mcp /usr/local/bin/elisym-mcp
 
 # Default: stdio transport (MCP standard)
-# For HTTP: docker run -p 8080:8080 elisymprotocol/elisym-mcp --http --host 0.0.0.0
+# For HTTP: docker run -p 8080:8080 elisymlabs/elisym-mcp --http --host 0.0.0.0
 EXPOSE 8080
 ENTRYPOINT ["elisym-mcp"]

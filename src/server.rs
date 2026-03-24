@@ -18,7 +18,6 @@ use rmcp::{
     model::*,
     tool, tool_handler, tool_router,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::agent_config;
@@ -215,18 +214,6 @@ fn validate_withdraw_amount(amount_sol: &str, balance: u64) -> Result<u64, Strin
     Ok(lamports)
 }
 
-/// Heartbeat message for ping/pong liveness checks (NIP-17 encrypted).
-///
-/// Wire format: JSON `{"type": "elisym_ping"|"elisym_pong", "nonce": "<hex>"}` sent as
-/// a NIP-17 gift-wrapped encrypted message. The pinger generates a random nonce and sends
-/// `elisym_ping`; the responder replies with `elisym_pong` and the same nonce.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HeartbeatMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    nonce: String,
-}
-
 /// Simple sliding-window rate limiter using atomics.
 /// Allows `max_calls` per `window_secs` second window.
 struct RateLimiter {
@@ -315,36 +302,23 @@ pub struct ElisymServer {
     tool_router: ToolRouter<Self>,
 }
 
-/// Spawn a background task that auto-responds to incoming `elisym_ping`
-/// messages with `elisym_pong` (same nonce), so other agents can detect
-/// that this agent is online.
+/// Spawn a background task that auto-responds to incoming pings
+/// with pongs via ephemeral events (kind 20200/20201).
 pub fn spawn_ping_responder(agent: Arc<AgentNode>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut rx = match agent.messaging.subscribe_to_messages().await {
+        let mut rx = match agent.messaging.subscribe_to_pings().await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::warn!("Ping responder: failed to subscribe to messages: {e}");
+                tracing::warn!("Ping responder: failed to subscribe to pings: {e}");
                 return;
             }
         };
-        tracing::debug!("Ping responder started");
-        while let Some(msg) = rx.recv().await {
-            let hb: HeartbeatMessage = match serde_json::from_str::<HeartbeatMessage>(&msg.content) {
-                Ok(hb) if hb.msg_type == "elisym_ping" => hb,
-                _ => continue,
-            };
-            let pong = HeartbeatMessage {
-                msg_type: "elisym_pong".into(),
-                nonce: hb.nonce,
-            };
-            if let Err(e) = agent
-                .messaging
-                .send_structured_message(&msg.sender, &pong)
-                .await
-            {
+        tracing::debug!("Ping responder started (ephemeral kind 20200/20201)");
+        while let Some((sender, nonce)) = rx.recv().await {
+            if let Err(e) = agent.messaging.send_pong(&sender, &nonce).await {
                 tracing::warn!("Ping responder: failed to send pong: {e}");
             } else {
-                tracing::debug!(sender = %msg.sender, "Ping responder: sent pong");
+                tracing::debug!(sender = %sender, "Ping responder: sent pong");
             }
         }
         tracing::debug!("Ping responder stopped");
@@ -922,49 +896,36 @@ impl ElisymServer {
         };
 
         // 1. Historical fetch — check if the result already exists on relays
-        let result_kind = Kind::from(KIND_JOB_RESULT_BASE + kind_offset);
-        let mut historical_filter = nostr_sdk::Filter::new()
-            .kind(result_kind)
-            .event(target_id);
-        if let Some(pk) = provider_pk {
-            historical_filter = historical_filter.author(pk);
-        }
         let agent = self.ensure_agent().await?;
-        let fetch_timeout = tokio::time::Duration::from_secs(5);
-        if let Ok(events) = agent
-            .client
-            .fetch_events(vec![historical_filter], Some(fetch_timeout))
+        if let Ok(results) = agent
+            .marketplace
+            .fetch_job_results(target_id, &[kind_offset])
             .await
         {
-            for event in events.iter() {
-                // Verify the #e tag matches our target job
-                let has_matching_e_tag = event.tags.iter().any(|tag| {
-                    let t = tag.as_slice();
-                    t.len() >= 2 && t[0] == "e" && t[1] == target_id.to_hex()
-                });
-                if has_matching_e_tag {
-                    let amount = event.tags.iter().find_map(|tag| {
-                        let t = tag.as_slice();
-                        if t.len() >= 2 && t[0] == "amount" {
-                            t[1].parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    });
-                    let amount_info = amount
-                        .map(|a| format!(" (amount: {a} lamports)"))
-                        .unwrap_or_default();
-                    let content_kind = if is_likely_base64(&event.content) {
-                        ContentKind::Binary
-                    } else {
-                        ContentKind::Text
-                    };
-                    let sanitized = sanitize_untrusted(&event.content, content_kind);
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Job result received{}:\n\n{}",
-                        amount_info, sanitized.text
-                    ))]));
-                }
+            // Filter by provider if specified
+            let matched = results.into_iter().find(|r| {
+                provider_pk.is_none_or(|pk| r.provider == pk)
+            });
+            if let Some(result) = matched {
+                let amount_info = result
+                    .amount
+                    .map(|a| format!(" (amount: {a} lamports)"))
+                    .unwrap_or_default();
+                let content_kind = if is_likely_base64(&result.content) {
+                    ContentKind::Binary
+                } else {
+                    ContentKind::Text
+                };
+                let sanitized = sanitize_untrusted(&result.content, content_kind);
+                let decrypt_warning = if let Some(ref err) = result.decryption_error {
+                    format!("\n⚠️ Decryption failed: {}", sanitize_field(err, 500))
+                } else {
+                    String::new()
+                };
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Job result received{}{}:\n\n{}",
+                    amount_info, decrypt_warning, sanitized.text
+                ))]));
             }
         }
 
@@ -1006,9 +967,14 @@ impl ElisymServer {
                     ContentKind::Text
                 };
                 let sanitized = sanitize_untrusted(&result.content, content_kind);
+                let decrypt_warning = if let Some(ref err) = result.decryption_error {
+                    format!("\n⚠️ Decryption failed: {}", sanitize_field(err, 500))
+                } else {
+                    String::new()
+                };
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Job result received{}:\n\n{}",
-                    amount_info, sanitized.text
+                    "Job result received{}{}:\n\n{}",
+                    amount_info, decrypt_warning, sanitized.text
                 ))]))
             }
             Ok(None) => Ok(CallToolResult::error(vec![Content::text(
@@ -1061,7 +1027,11 @@ impl ElisymServer {
                 "input_type": &job.input_type,
                 "tags": &job.tags,
                 "timestamp": job.raw_event.created_at.as_u64(),
+                "encrypted": job.encrypted,
             });
+            if let Some(ref err) = job.decryption_error {
+                entry["decryption_error"] = serde_json::json!(sanitize_field(err, 500));
+            }
 
             if let Some(bid) = job.bid {
                 entry["bid_lamports"] = serde_json::json!(bid);
@@ -1081,9 +1051,13 @@ impl ElisymServer {
                                 let mut re = serde_json::json!({
                                     "provider": r.provider.to_hex(),
                                     "content": sanitize_untrusted(&r.content, ContentKind::Text).text,
+                                    "encrypted": r.encrypted,
                                 });
                                 if let Some(amt) = r.amount {
                                     re["amount_lamports"] = serde_json::json!(amt);
+                                }
+                                if let Some(ref err) = r.decryption_error {
+                                    re["decryption_error"] = serde_json::json!(sanitize_field(err, 500));
                                 }
                                 re
                             })
@@ -1614,54 +1588,9 @@ impl ElisymServer {
         };
 
         let timeout_secs = input.timeout_secs.unwrap_or(15).min(MAX_TIMEOUT_SECS);
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = format!(
-            "{:x}{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-
-        // Subscribe to messages BEFORE sending ping
         let agent = self.ensure_agent().await?;
-        let mut msg_rx = match agent.messaging.subscribe_to_messages().await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Error subscribing to messages: {e}"
-                ))]))
-            }
-        };
 
-        let ping = HeartbeatMessage {
-            msg_type: "elisym_ping".into(),
-            nonce: nonce.clone(),
-        };
-
-        if let Err(e) = agent
-            .messaging
-            .send_structured_message(&target, &ping)
-            .await
-        {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error sending ping: {e}"
-            ))]));
-        }
-
-        let timeout = tokio::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, async {
-            while let Some(msg) = msg_rx.recv().await {
-                if let Ok(hb) = serde_json::from_str::<HeartbeatMessage>(&msg.content) {
-                    if hb.msg_type == "elisym_pong" && hb.nonce == nonce {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
-        .await
+        match agent.messaging.ping_agent(&target, timeout_secs).await
         {
             Ok(true) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Agent {} is online (pong received).",
@@ -1999,7 +1928,7 @@ impl ElisymServer {
                 let sanitized_tags: Vec<String> = job.tags.iter()
                     .map(|t| sanitize_field(t, MAX_TAG_LEN))
                     .collect();
-                let info = serde_json::json!({
+                let mut info = serde_json::json!({
                     "event_id": event_id.to_string(),
                     "customer_npub": customer_npub,
                     "kind_offset": job.kind_offset,
@@ -2007,7 +1936,11 @@ impl ElisymServer {
                     "input_type": sanitize_field(&job.input_type, 100),
                     "bid_amount": job.bid,
                     "tags": sanitized_tags,
+                    "encrypted": job.encrypted,
                 });
+                if let Some(ref err) = job.decryption_error {
+                    info["decryption_error"] = serde_json::json!(sanitize_field(err, 500));
+                }
                 let json = serde_json::to_string_pretty(&info)
                     .unwrap_or_else(|e| format!("Error serializing job: {e}"));
                 Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -2112,7 +2045,7 @@ impl ElisymServer {
                         let sanitized_tags: Vec<String> = job.tags.iter()
                             .map(|t| sanitize_field(t, MAX_TAG_LEN))
                             .collect();
-                        let info = serde_json::json!({
+                        let mut info = serde_json::json!({
                             "event_type": "job_request",
                             "event_id": event_id.to_string(),
                             "customer_npub": job.customer.to_bech32().unwrap_or_default(),
@@ -2121,7 +2054,11 @@ impl ElisymServer {
                             "input_type": sanitize_field(&job.input_type, 100),
                             "bid_amount": job.bid,
                             "tags": sanitized_tags,
+                            "encrypted": job.encrypted,
                         });
+                        if let Some(ref err) = job.decryption_error {
+                            info["decryption_error"] = serde_json::json!(sanitize_field(err, 500));
+                        }
                         let json = serde_json::to_string_pretty(&info)
                             .unwrap_or_else(|e| format!("Error serializing job: {e}"));
                         return Ok(CallToolResult::success(vec![Content::text(json)]));
@@ -2747,7 +2684,7 @@ impl ServerHandler for ElisymServer {
                 .build(),
         )
         .with_instructions(
-            "elisym protocol MCP server — discover AI agents, submit jobs, \
+            "elisym MCP server — discover AI agents, submit jobs, \
              send messages, and manage payments on the Nostr-based agent marketplace. \
              Use search_agents to find providers, create_job to submit tasks, \
              get_job_result to retrieve results, and get_balance/send_payment for Solana wallet. \

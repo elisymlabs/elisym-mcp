@@ -52,8 +52,8 @@ function getBinaryPath() {
     `Could not find ${BINARY} binary.\n\n` +
       `Install options:\n` +
       `  cargo install elisym-mcp\n` +
-      `  brew install elisymprotocol/tap/elisym-mcp\n` +
-      `  docker run -i --rm elisymprotocol/elisym-mcp\n`
+      `  brew install elisymlabs/tap/elisym-mcp\n` +
+      `  docker run -i --rm elisymlabs/elisym-mcp\n`
   );
   process.exit(1);
 }
