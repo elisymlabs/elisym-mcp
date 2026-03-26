@@ -1257,8 +1257,8 @@ impl ElisymServer {
         };
 
         // Look up provider's Solana address from their capability card for recipient validation.
-        // Hard-fail: if we can't verify the recipient, we refuse to pay.
-        let provider_solana_address: String = {
+        // For paid jobs we hard-fail if the address is missing; for free jobs (price=0) it's optional.
+        let (provider_solana_address, provider_job_price) = {
             let filter = AgentFilter::default();
             let agents = match self.ensure_agent().await?.discovery.search_agents(&filter).await {
                 Ok(a) => a,
@@ -1268,21 +1268,22 @@ impl ElisymServer {
                     ))]))
                 }
             };
-            match agents
+            let payment_info = agents
                 .iter()
                 .find(|a| a.pubkey == provider_pk)
-                .and_then(|a| a.cards.first().and_then(|c| c.payment.as_ref()))
-                .map(|p| p.address.clone())
-            {
-                Some(addr) => addr,
-                None => {
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Cannot verify provider: no capability card with payment address found. \
-                         Provider must publish a capability card with a Solana address to receive payments."
-                    )]))
-                }
-            }
+                .and_then(|a| a.cards.first().and_then(|c| c.payment.as_ref()));
+            let addr = payment_info.map(|p| p.address.clone());
+            let price = payment_info.and_then(|p| p.job_price).unwrap_or(0);
+            (addr, price)
         };
+
+        // For paid jobs, require a verified Solana address up front.
+        if provider_job_price > 0 && provider_solana_address.is_none() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Cannot verify provider: no capability card with payment address found. \
+                 Provider must publish a capability card with a Solana address to receive payments."
+            )]));
+        }
 
         let kind_offset = input.kind_offset.unwrap_or(DEFAULT_KIND_OFFSET);
         let input_type = input.input_type.as_deref().unwrap_or("text");
@@ -1430,8 +1431,17 @@ impl ElisymServer {
                                     _ => {} // max_price set and sufficient, proceed to pay
                                 }
 
-                                // Validate recipient and fee before paying
-                                if let Err(err) = validate_protocol_fee(payment_request, &provider_solana_address) {
+                                // Validate recipient and fee before paying.
+                                // Fallback check: even if early validation passed (job_price=0),
+                                // the provider may still request payment at runtime — reject if
+                                // no verified Solana address is available.
+                                let Some(ref verified_addr) = provider_solana_address else {
+                                    status_log.push("Payment required but provider has no verified Solana address.".into());
+                                    return Ok(CallToolResult::error(vec![Content::text(
+                                        status_log.join("\n")
+                                    )]));
+                                };
+                                if let Err(err) = validate_protocol_fee(payment_request, verified_addr) {
                                     status_log.push(format!("Fee validation failed: {err}"));
                                     return Ok(CallToolResult::error(vec![Content::text(
                                         status_log.join("\n")
@@ -1445,7 +1455,7 @@ impl ElisymServer {
                                 }
                                 let pay_agent = Arc::clone(&agent);
                                 let pr = payment_request.clone();
-                                let expected_addr = provider_solana_address.clone();
+                                let expected_addr = verified_addr.clone();
                                 match tokio::task::spawn_blocking(move || {
                                     pay_agent.solana_payments().unwrap().pay_validated(&pr, &expected_addr)
                                 }).await {
