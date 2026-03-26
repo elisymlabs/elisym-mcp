@@ -27,14 +27,12 @@ pub struct SearchAgentsInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCapabilitiesInput {}
 
-/// A discovered agent returned by search.
+/// Summary of a single capability card published by an agent.
 #[derive(Debug, Serialize)]
-pub struct AgentInfo {
-    pub npub: String,
+pub struct CardSummary {
     pub name: String,
     pub description: String,
     pub capabilities: Vec<String>,
-    pub supported_kinds: Vec<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job_price_lamports: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,4 +41,12 @@ pub struct AgentInfo {
     pub network: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// A discovered agent returned by search.
+#[derive(Debug, Serialize)]
+pub struct AgentInfo {
+    pub npub: String,
+    pub supported_kinds: Vec<u16>,
+    pub cards: Vec<CardSummary>,
 }

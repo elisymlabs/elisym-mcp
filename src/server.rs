@@ -24,7 +24,7 @@ use crate::agent_config;
 use crate::tools::agent::{CreateAgentInput, GoOnlineInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
 use crate::tools::customer::{GetJobFeedbackInput, ListMyJobsInput, PingAgentInput, SubmitAndPayJobInput};
 use crate::tools::dashboard::GetDashboardInput;
-use crate::tools::discovery::{AgentInfo, ListCapabilitiesInput, SearchAgentsInput};
+use crate::tools::discovery::{AgentInfo, CardSummary, ListCapabilitiesInput, SearchAgentsInput};
 use crate::tools::marketplace::{CreateJobInput, GetJobResultInput};
 use crate::tools::messaging::{ReceiveMessagesInput, SendMessageInput};
 use crate::tools::poll_events::PollEventsInput;
@@ -489,17 +489,22 @@ impl ElisymServer {
                 let mut infos: Vec<AgentInfo> = agents
                     .iter()
                     .map(|a| {
-                        let pay = a.card.payment.as_ref();
+                        let cards: Vec<CardSummary> = a.cards.iter().map(|c| {
+                            let cpay = c.payment.as_ref();
+                            CardSummary {
+                                name: sanitize_field(&c.name, 200),
+                                description: sanitize_field(&c.description, 1000),
+                                capabilities: c.capabilities.iter().map(|cap| sanitize_field(cap, 200)).collect(),
+                                job_price_lamports: cpay.and_then(|p| p.job_price),
+                                chain: cpay.map(|p| p.chain.clone()),
+                                network: cpay.map(|p| p.network.clone()),
+                                version: c.version.clone(),
+                            }
+                        }).collect();
                         AgentInfo {
                             npub: a.pubkey.to_bech32().unwrap_or_default(),
-                            name: sanitize_field(&a.card.name, 200),
-                            description: sanitize_field(&a.card.description, 1000),
-                            capabilities: a.card.capabilities.iter().map(|c| sanitize_field(c, 200)).collect(),
                             supported_kinds: a.supported_kinds.clone(),
-                            job_price_lamports: pay.and_then(|p| p.job_price),
-                            chain: pay.map(|p| p.chain.clone()),
-                            network: pay.map(|p| p.network.clone()),
-                            version: a.card.version.clone(),
+                            cards,
                         }
                     })
                     .collect();
@@ -508,16 +513,20 @@ impl ElisymServer {
                 if let Some(ref q) = query {
                     let q_lower = q.to_lowercase();
                     infos.retain(|info| {
-                        info.name.to_lowercase().contains(&q_lower)
-                            || info.description.to_lowercase().contains(&q_lower)
-                            || info.capabilities.iter().any(|c| c.to_lowercase().contains(&q_lower))
+                        info.cards.iter().any(|c| {
+                            c.name.to_lowercase().contains(&q_lower)
+                                || c.description.to_lowercase().contains(&q_lower)
+                                || c.capabilities.iter().any(|cap| cap.to_lowercase().contains(&q_lower))
+                        })
                     });
                 }
 
-                // Apply max price filter
+                // Apply max price filter (agent passes if any card is within budget)
                 if let Some(limit) = max_price {
                     infos.retain(|info| {
-                        info.job_price_lamports.is_none_or(|price| price <= limit)
+                        info.cards.iter().any(|c| {
+                            c.job_price_lamports.is_none_or(|price| price <= limit)
+                        })
                     });
                 }
 
@@ -548,12 +557,14 @@ impl ElisymServer {
             Ok(agents) => {
                 let mut all_caps = std::collections::BTreeSet::new();
                 for agent in &agents {
-                    for cap in &agent.card.capabilities {
-                        // Skip the "elisym" marker tag — it's a protocol tag, not a capability
-                        if cap == "elisym" {
-                            continue;
+                    for card in &agent.cards {
+                        for cap in &card.capabilities {
+                            // Skip the "elisym" marker tag — it's a protocol tag, not a capability
+                            if cap == "elisym" {
+                                continue;
+                            }
+                            all_caps.insert(sanitize_field(cap, 200));
                         }
-                        all_caps.insert(sanitize_field(cap, 200));
                     }
                 }
                 if all_caps.is_empty() {
@@ -580,16 +591,19 @@ impl ElisymServer {
     async fn get_identity(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let agent = self.ensure_agent().await?;
         let pay = agent.capability_card.payment.as_ref();
+        let card = &agent.capability_card;
         let info = AgentInfo {
             npub: agent.identity.npub(),
-            name: agent.capability_card.name.clone(),
-            description: agent.capability_card.description.clone(),
-            capabilities: agent.capability_card.capabilities.clone(),
             supported_kinds: vec![DEFAULT_KIND_OFFSET],
-            job_price_lamports: pay.and_then(|p| p.job_price),
-            chain: pay.map(|p| p.chain.clone()),
-            network: pay.map(|p| p.network.clone()),
-            version: agent.capability_card.version.clone(),
+            cards: vec![CardSummary {
+                name: card.name.clone(),
+                description: card.description.clone(),
+                capabilities: card.capabilities.clone(),
+                job_price_lamports: pay.and_then(|p| p.job_price),
+                chain: pay.map(|p| p.chain.clone()),
+                network: pay.map(|p| p.network.clone()),
+                version: card.version.clone(),
+            }],
         };
         let json = serde_json::to_string_pretty(&info)
             .unwrap_or_else(|e| format!("Error serializing identity: {e}"));
@@ -622,10 +636,11 @@ impl ElisymServer {
         let agents: Vec<_> = all_agents
             .into_iter()
             .filter(|a| {
-                let chain = a.card.payment.as_ref()
+                let first = a.cards.first();
+                let chain = first.and_then(|c| c.payment.as_ref())
                     .map(|p| p.chain.as_str())
                     .unwrap_or("solana");
-                let network = a.card.payment.as_ref()
+                let network = first.and_then(|c| c.payment.as_ref())
                     .map(|p| p.network.as_str())
                     .unwrap_or("devnet");
                 chain.eq_ignore_ascii_case(&filter_chain)
@@ -704,14 +719,13 @@ impl ElisymServer {
 
         let mut rows: Vec<AgentRow> = agents
             .iter()
-            .filter(|a| !a.card.capabilities.is_empty())
+            .filter(|a| a.cards.iter().any(|c| !c.capabilities.is_empty()))
             .map(|a| {
+                let first = a.cards.first();
                 let npub = pk_to_npub.get(&a.pubkey).cloned().unwrap_or_default();
                 let earned = earnings.get(npub.as_str()).copied().unwrap_or(0);
-                let price = a
-                    .card
-                    .payment
-                    .as_ref()
+                let price = first
+                    .and_then(|c| c.payment.as_ref())
                     .and_then(|p| p.job_price)
                     .unwrap_or(0);
                 let price_str = if price == 0 {
@@ -720,9 +734,9 @@ impl ElisymServer {
                     format_sol_short(price)
                 };
                 AgentRow {
-                    name: sanitize_field(&a.card.name, 200),
+                    name: sanitize_field(first.map(|c| c.name.as_str()).unwrap_or(""), 200),
                     npub: truncate_str(&npub, 20).into_owned(),
-                    capabilities: a.card.capabilities.iter().map(|c| sanitize_field(c, 200)).collect::<Vec<_>>().join(", "),
+                    capabilities: a.cards.iter().flat_map(|c| c.capabilities.iter()).map(|c| sanitize_field(c, 200)).collect::<Vec<_>>().join(", "),
                     price: price_str,
                     earned,
                 }
@@ -1257,7 +1271,7 @@ impl ElisymServer {
             match agents
                 .iter()
                 .find(|a| a.pubkey == provider_pk)
-                .and_then(|a| a.card.payment.as_ref())
+                .and_then(|a| a.cards.first().and_then(|c| c.payment.as_ref()))
                 .map(|p| p.address.clone())
             {
                 Some(addr) => addr,
