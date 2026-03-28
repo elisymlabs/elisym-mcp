@@ -268,9 +268,12 @@ async fn start_http_server(
         ..Default::default()
     };
 
+    let job_listener = Arc::new(server::JobListenerState::new());
+
     let registry_clone = Arc::clone(&agent_registry);
     let active_clone = Arc::clone(&active_agent_name);
     let job_cache_clone = Arc::clone(&job_cache);
+    let job_listener_clone = Arc::clone(&job_listener);
     let service: StreamableHttpService<ElisymServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(ElisymServer::from_shared(
@@ -278,6 +281,7 @@ async fn start_http_server(
                 Arc::clone(&active_clone),
                 Arc::clone(&job_cache_clone),
                 withdrawal_address.clone(),
+                Arc::clone(&job_listener_clone),
             )),
             Default::default(),
             config,
