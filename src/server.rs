@@ -847,7 +847,7 @@ impl ElisymServer {
         }
         let query = input.query;
         let max_price = input.max_price_lamports;
-        let online_only = input.online_only.unwrap_or(true);
+        let online_only = input.online_only;
 
         let since_online = if online_only {
             Some(nostr_sdk::Timestamp::from(
@@ -3077,6 +3077,8 @@ async fn run_payment_event_loop(
     let mut payment_tx_signature: Option<String> = None;
     let mut feedback_closed = false;
     let mut result_closed = false;
+    let mut empty_payment_required_count: u32 = 0;
+    const MAX_EMPTY_PAYMENT_REQUIRED: u32 = 3;
 
     loop {
         tokio::select! {
@@ -3112,10 +3114,17 @@ async fn run_payment_event_loop(
                     "payment-required" => {
                         tracing::info!(event_id = %event_id, "Provider requested payment");
                         let Some(payment_request) = &fb.payment_request else {
-                            status_log.push("Payment required but no payment request provided by provider.".into());
-                            return Ok(CallToolResult::error(vec![Content::text(
-                                status_log.join("\n")
-                            )]));
+                            // Payment-required feedback without payment_request data —
+                            // ignore and keep waiting for a complete one.
+                            empty_payment_required_count += 1;
+                            if empty_payment_required_count >= MAX_EMPTY_PAYMENT_REQUIRED {
+                                status_log.push("Provider sent payment-required multiple times without payment details.".into());
+                                return Ok(CallToolResult::error(vec![Content::text(
+                                    status_log.join("\n")
+                                )]));
+                            }
+                            tracing::debug!(event_id = %event_id, attempt = empty_payment_required_count, "payment-required feedback missing payment_request, ignoring");
+                            continue;
                         };
                         // Parse the payment request to extract total cost.
                         // `amount` is the total the customer pays; fee is deducted from it

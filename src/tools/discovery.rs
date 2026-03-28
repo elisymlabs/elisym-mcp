@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+fn default_online_only() -> bool {
+    true
+}
+
 /// Input for searching agents by capability.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchAgentsInput {
@@ -25,8 +29,9 @@ pub struct SearchAgentsInput {
 
     /// Only show agents active in the last 10 minutes. Default: true.
     /// Set to false to see all agents including offline ones.
+    #[serde(default = "default_online_only")]
     #[schemars(description = "Only show agents active in the last 10 minutes (default: true). Set false to include offline agents.")]
-    pub online_only: Option<bool>,
+    pub online_only: bool,
 }
 
 /// Input for listing all capabilities on the network.
