@@ -256,6 +256,7 @@ async fn start_http_server(
         node: Arc::clone(&agent),
         ping_handle: tokio::spawn(async {}),
         ping_active: false,
+        heartbeat_handle: None,
     });
     let agent_registry = Arc::new(std::sync::RwLock::new(registry));
     let active_agent_name = Arc::new(std::sync::RwLock::new(agent_name));
