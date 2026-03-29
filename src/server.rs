@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use elisym_core::{
     AgentFilter, AgentNode, DiscoveredAgent, JobRequest, PaymentProvider,
     DEFAULT_KIND_OFFSET, KIND_JOB_FEEDBACK, KIND_JOB_RESULT_BASE, kind,
-    validate_protocol_fee,
+    validate_protocol_fee, to_d_tag,
 };
 #[cfg(test)]
 use elisym_core::calculate_protocol_fee;
@@ -1859,7 +1859,7 @@ impl ElisymServer {
             }
         };
 
-        let capability_dtag = input.capability.to_lowercase().replace(' ', "-");
+        let capability_dtag = to_d_tag(&input.capability);
         let kind_offset = DEFAULT_KIND_OFFSET;
         let total_timeout = input.timeout_secs.unwrap_or(120).min(MAX_TIMEOUT_SECS);
         let max_price = input.max_price_lamports;
@@ -1880,8 +1880,36 @@ impl ElisymServer {
                 }
             };
             let provider_agent = agents.iter().find(|a| a.pubkey == provider_pk);
-            let payment_info = provider_agent
-                .and_then(|a| a.cards.first().and_then(|c| c.payment.as_ref()));
+            // Find the card matching the requested capability by d-tag
+            let matching_card = provider_agent.and_then(|a| {
+                a.cards.iter().find(|c| to_d_tag(&c.name) == capability_dtag)
+            });
+            // Fall back to first card only for single-card providers
+            let card = matching_card.or_else(|| {
+                provider_agent.and_then(|a| if a.cards.len() == 1 { a.cards.first() } else { None })
+            });
+            if card.is_none() {
+                if let Some(provider) = provider_agent {
+                    if provider.cards.is_empty() {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "Provider has no published capabilities."
+                        )]));
+                    }
+                    if provider.cards.len() > 1 {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Provider has {} capabilities but none match \"{}\". Available: {}",
+                            provider.cards.len(),
+                            input.capability,
+                            provider.cards.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                        ))]));
+                    }
+                } else {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Provider not found in discovery. They may be offline or not yet published their capabilities."
+                    )]));
+                }
+            }
+            let payment_info = card.and_then(|c| c.payment.as_ref());
             let addr = payment_info.map(|p| p.address.clone());
             let price = payment_info.and_then(|p| p.job_price).unwrap_or(0);
             (addr, price)
