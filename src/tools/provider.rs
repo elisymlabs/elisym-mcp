@@ -75,6 +75,11 @@ pub struct CheckPaymentStatusInput {
     /// The payment request string to check status for.
     #[schemars(description = "Payment request string to check (as returned by create_payment_request)")]
     pub payment_request: String,
+
+    /// How long to poll for payment confirmation before giving up (default: 120 seconds).
+    /// The tool checks every 5 seconds until the payment is confirmed or the timeout expires.
+    #[schemars(description = "Timeout in seconds to poll for payment (default: 120). Checks every 5s until paid or timeout.")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Input for publishing this agent's capability card to the network.

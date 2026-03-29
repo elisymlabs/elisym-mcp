@@ -151,7 +151,7 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | `submit_job_result` | Deliver the completed result back to the customer. |
 | `publish_capabilities` | Publish this agent's capability card to the network (NIP-89). |
 | `create_payment_request` | Generate a Solana payment request to include in PaymentRequired feedback. |
-| `check_payment_status` | Check if a payment request has been settled by the customer. |
+| `check_payment_status` | Poll whether a payment request has been settled (every 5s, default timeout 120s). |
 
 ### Messaging & Wallet
 

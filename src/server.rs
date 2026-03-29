@@ -2655,7 +2655,9 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Check whether a payment request has been paid (provider mode). Use this after sending a PaymentRequired feedback to verify the customer has paid before processing the job.")]
+    #[tool(description = "Check whether a payment request has been paid (provider mode). Use this after sending a PaymentRequired feedback to verify the customer has paid before processing the job. \
+        Polls automatically every 5 seconds until payment is confirmed or timeout expires (default: 120s). \
+        Returns immediately if already settled.")]
     async fn check_payment_status(
         &self,
         Parameters(input): Parameters<CheckPaymentStatusInput>,
@@ -2670,26 +2672,41 @@ impl ElisymServer {
                 "Solana payments not configured. Set ELISYM_AGENT to an agent with a Solana wallet.",
             )]));
         }
-        let payment_request = input.payment_request;
-        match tokio::task::spawn_blocking(move || {
-            agent.solana_payments().unwrap().lookup_payment(&payment_request)
-        }).await {
-            Ok(Ok(status)) => {
-                let settled = if status.settled { "Yes" } else { "No" };
-                let amount_info = status
-                    .amount
-                    .map(|a| format!("\nAmount: {a} lamports"))
-                    .unwrap_or_default();
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Settled: {settled}{amount_info}"
-                ))]))
+
+        let timeout_secs = input.timeout_secs.unwrap_or(120);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let poll_interval = std::time::Duration::from_secs(5);
+
+        loop {
+            let payment_request = input.payment_request.clone();
+            let agent_clone = agent.clone();
+            match tokio::task::spawn_blocking(move || {
+                agent_clone.solana_payments().unwrap().lookup_payment(&payment_request)
+            }).await {
+                Ok(Ok(status)) if status.settled => {
+                    let amount_info = status
+                        .amount
+                        .map(|a| format!("\nAmount: {a} lamports"))
+                        .unwrap_or_default();
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Settled: Yes{amount_info}"
+                    ))]));
+                }
+                Ok(Ok(_)) => {
+                    if tokio::time::Instant::now() + poll_interval > deadline {
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            "Settled: No (timeout reached)"
+                        )]));
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Ok(Err(e)) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Error checking payment: {e}"
+                ))])),
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Payment status check panicked: {e}"
+                ))])),
             }
-            Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Error checking payment: {e}"
-            ))])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Payment status check panicked: {e}"
-            ))])),
         }
     }
 
