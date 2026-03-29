@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use elisym_core::{
     AgentFilter, AgentNode, DiscoveredAgent, JobRequest, PaymentProvider,
@@ -21,7 +21,7 @@ use rmcp::{
 use tokio::sync::{Mutex, mpsc};
 
 use crate::agent_config;
-use crate::tools::agent::{CreateAgentInput, GoOnlineInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
+use crate::tools::agent::{CreateAgentInput, ListAgentsInput, StopAgentInput, SwitchAgentInput};
 use crate::tools::customer::{BuyCapabilityInput, GetJobFeedbackInput, ListMyJobsInput, PingAgentInput, SubmitAndPayJobInput};
 use crate::tools::dashboard::GetDashboardInput;
 use crate::tools::discovery::{AgentInfo, CardSummary, ListCapabilitiesInput, SearchAgentsInput};
@@ -286,6 +286,25 @@ pub struct AgentEntry {
     pub ping_handle: tokio::task::JoinHandle<()>,
     pub ping_active: bool,
     pub heartbeat_handle: Option<elisym_core::HeartbeatHandle>,
+    /// Watchdog task that auto-stops heartbeat+ping when polling stops.
+    pub watchdog_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Unix timestamp of the last poll_next_job/poll_events call for this agent.
+    /// Used by the watchdog to auto-stop heartbeat when polling stops.
+    pub last_poll_time: Arc<AtomicI64>,
+}
+
+impl AgentEntry {
+    /// Create a new entry with default (inactive) ping/heartbeat/watchdog state.
+    pub fn new(node: Arc<AgentNode>) -> Self {
+        Self {
+            node,
+            ping_handle: tokio::spawn(async {}),
+            ping_active: false,
+            heartbeat_handle: None,
+            watchdog_handle: None,
+            last_poll_time: Arc::new(AtomicI64::new(0)),
+        }
+    }
 }
 
 /// Running state of the background job listener (protected by a single Mutex).
@@ -318,6 +337,10 @@ impl JobListenerState {
         }
     }
 }
+
+/// Inactivity timeout: if no poll_next_job/poll_events call within this duration,
+/// the watchdog stops the heartbeat and ping responder so the agent appears offline.
+const POLL_INACTIVITY_SECS: i64 = 720; // 12 minutes
 
 pub struct ElisymServer {
     /// Builder for lazy agent initialization. Consumed on first tool call.
@@ -452,12 +475,7 @@ impl ElisymServer {
         );
 
         if let Ok(mut registry) = self.agent_registry.write() {
-            registry.insert(name.clone(), AgentEntry {
-                node: Arc::clone(&agent),
-                ping_handle: tokio::spawn(async {}),
-                ping_active: false,
-                heartbeat_handle: None,
-            });
+            registry.insert(name.clone(), AgentEntry::new(Arc::clone(&agent)));
         }
         if let Ok(mut active) = self.active_agent_name.write() {
             *active = name;
@@ -694,7 +712,28 @@ impl ElisymServer {
         ).await
     }
 
+    /// Update the last poll timestamp for the active agent — keeps its watchdog from stopping heartbeat.
+    fn touch_poll_time(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let active_name = match self.active_agent_name.read() {
+            Ok(n) => n.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to read active_agent_name (poisoned lock)");
+                return;
+            }
+        };
+        if let Ok(registry) = self.agent_registry.read() {
+            if let Some(entry) = registry.get(&active_name) {
+                entry.last_poll_time.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Start the ping responder for the active agent if not already running.
+    /// Also spawns a watchdog that auto-stops heartbeat+ping when polling is inactive.
     /// Returns `true` if it was just started, `false` if already active.
     fn activate_ping_responder(&self, agent: &Arc<AgentNode>) -> bool {
         let active_name = self.active_agent_name.read()
@@ -713,6 +752,25 @@ impl ElisymServer {
             }
         }
 
+        // Get the agent's own last_poll_time and record current time
+        let agent_poll_time = if let Ok(registry) = self.agent_registry.read() {
+            registry.get(&active_name).map(|e| Arc::clone(&e.last_poll_time))
+        } else {
+            None
+        };
+        let agent_poll_time = match agent_poll_time {
+            Some(pt) => pt,
+            None => {
+                tracing::error!(agent = %active_name, "Agent not found in registry");
+                return false;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        agent_poll_time.store(now, Ordering::Relaxed);
+
         let ping_handle = spawn_ping_responder(Arc::clone(agent));
 
         // Start heartbeat — republish capability card every 10min to keep created_at fresh
@@ -720,8 +778,56 @@ impl ElisymServer {
             agent.capability_card.clone(),
             vec![elisym_core::KIND_JOB_REQUEST_BASE + elisym_core::DEFAULT_KIND_OFFSET],
             std::time::Duration::from_secs(600),
-            true, // skip first tick — publish_capability already called in go_online flow
+            true, // skip first tick — publish_capability already called
         );
+
+        // Spawn watchdog: auto-stop heartbeat+ping if no poll call within POLL_INACTIVITY_SECS
+        let watchdog_registry = Arc::clone(&self.agent_registry);
+        let watchdog_name = active_name.clone();
+        let watchdog_poll_time = Arc::clone(&agent_poll_time);
+        let watchdog_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+                let last = watchdog_poll_time.load(Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if now - last > POLL_INACTIVITY_SECS {
+                    if let Ok(mut registry) = watchdog_registry.write() {
+                        // Double-check after acquiring lock: polling may have resumed
+                        // between the initial check and lock acquisition.
+                        let last_recheck = watchdog_poll_time.load(Ordering::Relaxed);
+                        let now_recheck = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        if now_recheck - last_recheck <= POLL_INACTIVITY_SECS {
+                            continue; // polling resumed, don't stop
+                        }
+
+                        tracing::info!(
+                            agent = %watchdog_name,
+                            idle_secs = now_recheck - last_recheck,
+                            "Watchdog: no poll activity — stopping heartbeat and ping responder"
+                        );
+                        if let Some(entry) = registry.get_mut(&watchdog_name) {
+                            if entry.ping_active {
+                                entry.ping_handle.abort();
+                                entry.ping_active = false;
+                                entry.ping_handle = tokio::spawn(async {});
+                                if let Some(hb) = entry.heartbeat_handle.take() {
+                                    hb.abort();
+                                }
+                                // Clear watchdog handle — this task is exiting, no need to self-abort
+                                entry.watchdog_handle.take();
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        });
 
         if let Ok(mut registry) = self.agent_registry.write() {
             if let Some(entry) = registry.get_mut(&active_name) {
@@ -732,15 +838,20 @@ impl ElisymServer {
                     old.abort();
                 }
                 entry.heartbeat_handle = Some(heartbeat_handle);
+                if let Some(old_wd) = entry.watchdog_handle.take() {
+                    old_wd.abort();
+                }
+                entry.watchdog_handle = Some(watchdog_handle);
             }
         } else {
             ping_handle.abort();
             heartbeat_handle.abort();
+            watchdog_handle.abort();
             tracing::error!(agent = %active_name, "Failed to write to agent registry (poisoned lock)");
             return false;
         }
 
-        tracing::info!(agent = %active_name, "Ping responder and heartbeat started — agent is now online");
+        tracing::info!(agent = %active_name, "Ping responder, heartbeat, and watchdog started — agent is now online");
         true
     }
 
@@ -2135,6 +2246,9 @@ impl ElisymServer {
 
         let agent = self.ensure_agent().await?;
 
+        // Record poll activity for watchdog
+        self.touch_poll_time();
+
         // Auto-start ping responder when polling — provider should be discoverable
         self.activate_ping_responder(&agent);
 
@@ -2204,6 +2318,12 @@ impl ElisymServer {
         }
 
         let agent = self.ensure_agent().await?;
+
+        // Auto-start ping responder when polling — provider should be discoverable
+        if listen_jobs {
+            self.touch_poll_time();
+            self.activate_ping_responder(&agent);
+        }
 
         // Start the persistent background job listener (no-op if already running)
         if listen_jobs {
@@ -2694,14 +2814,9 @@ impl ElisymServer {
                         .map(|p| p.address())
                         .unwrap_or_default();
 
-                    // Add to registry (ping responder not started — use go_online to start it)
+                    // Add to registry (ping responder starts automatically on poll_next_job/poll_events)
                     if let Ok(mut registry) = self.agent_registry.write() {
-                        registry.insert(input.name.clone(), AgentEntry {
-                            node: Arc::clone(&agent),
-                            ping_handle: tokio::spawn(async {}),
-                            ping_active: false,
-                            heartbeat_handle: None,
-                        });
+                        registry.insert(input.name.clone(), AgentEntry::new(Arc::clone(&agent)));
                     }
 
                     let mut result = format!(
@@ -2768,12 +2883,7 @@ impl ElisymServer {
                 Ok(node) => {
                     let agent = Arc::new(node);
                     if let Ok(mut registry) = self.agent_registry.write() {
-                        registry.insert(input.name.clone(), AgentEntry {
-                            node: Arc::clone(&agent),
-                            ping_handle: tokio::spawn(async {}),
-                            ping_active: false,
-                            heartbeat_handle: None,
-                        });
+                        registry.insert(input.name.clone(), AgentEntry::new(Arc::clone(&agent)));
                     }
                     agent
                 }
@@ -2809,8 +2919,11 @@ impl ElisymServer {
                         if let Some(hb) = prev_entry.heartbeat_handle.take() {
                             hb.abort();
                         }
+                        if let Some(wd) = prev_entry.watchdog_handle.take() {
+                            wd.abort();
+                        }
                         prev_entry.ping_handle = tokio::spawn(async {});
-                        tracing::info!(agent = %prev_agent_name, "Stopped ping responder, heartbeat, and job listener for previous agent");
+                        tracing::info!(agent = %prev_agent_name, "Stopped ping responder, heartbeat, watchdog, and job listener for previous agent");
                     }
                 }
             }
@@ -2911,6 +3024,9 @@ impl ElisymServer {
                 if let Some(hb) = entry.heartbeat_handle {
                     hb.abort();
                 }
+                if let Some(wd) = entry.watchdog_handle {
+                    wd.abort();
+                }
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Agent '{}' stopped. Ping responder and heartbeat cancelled — agent will appear offline.",
                     input.name
@@ -2923,29 +3039,6 @@ impl ElisymServer {
         }
     }
 
-    #[tool(description = "Go online — start the ping responder so this agent appears online on the network and responds to ping heartbeats. Without this, the agent works normally but won't respond to ping_agent checks from other agents.")]
-    async fn go_online(
-        &self,
-        Parameters(_input): Parameters<GoOnlineInput>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let agent = self.ensure_agent().await?;
-        let active_name = self.active_agent_name.read()
-            .ok()
-            .map(|n| n.clone())
-            .unwrap_or_default();
-
-        if self.activate_ping_responder(&agent) {
-            Ok(CallToolResult::success(vec![Content::text(format!(
-                "Agent '{}' is now online. Responding to ping heartbeats.",
-                active_name
-            ))]))
-        } else {
-            Ok(CallToolResult::success(vec![Content::text(format!(
-                "Agent '{}' is already online.",
-                active_name
-            ))]))
-        }
-    }
 }
 
 /// Format result output with links (shared by all job flows).

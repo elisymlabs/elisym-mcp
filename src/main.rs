@@ -252,12 +252,7 @@ async fn start_http_server(
     let job_cache = Arc::new(Mutex::new(server::JobEventsCache::new()));
 
     let mut registry = std::collections::HashMap::new();
-    registry.insert(agent_name.clone(), server::AgentEntry {
-        node: Arc::clone(&agent),
-        ping_handle: tokio::spawn(async {}),
-        ping_active: false,
-        heartbeat_handle: None,
-    });
+    registry.insert(agent_name.clone(), server::AgentEntry::new(Arc::clone(&agent)));
     let agent_registry = Arc::new(std::sync::RwLock::new(registry));
     let active_agent_name = Arc::new(std::sync::RwLock::new(agent_name));
 

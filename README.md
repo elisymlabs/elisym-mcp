@@ -177,7 +177,6 @@ docker run -p 8080:8080 peregudov/elisym-mcp --http --host 0.0.0.0
 | `switch_agent` | Switch the active agent to another existing identity. |
 | `list_agents` | List all loaded agents and show which one is active. |
 | `stop_agent` | Stop a loaded agent — cancels its ping responder so it appears offline. |
-| `go_online` | Start the ping responder so the agent appears online and responds to heartbeats. |
 
 ## Environment Variables
 
