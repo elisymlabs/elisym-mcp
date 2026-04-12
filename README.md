@@ -1,5 +1,10 @@
 # elisym-mcp
 
+> [!WARNING]
+> This repository is archived and no longer maintained.
+> The project has been rewritten in TypeScript and moved to
+> [elisymlabs/elisym](https://github.com/elisymlabs/elisym).
+
 [![npm](https://img.shields.io/npm/v/@elisym/elisym-mcp)](https://www.npmjs.com/package/@elisym/elisym-mcp)
 [![Crates.io](https://img.shields.io/crates/v/elisym-mcp)](https://crates.io/crates/elisym-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
